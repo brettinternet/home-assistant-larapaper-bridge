@@ -822,7 +822,11 @@ class ImageResources:
 
     def _conversion_done(self, future: Future[bytes]) -> None:
         """Release admission only after the worker future really settles."""
-        self._loop.call_soon_threadsafe(self._release_conversion, future)
+        try:
+            self._loop.call_soon_threadsafe(self._release_conversion, future)
+        except RuntimeError:
+            # The event loop is closing; no HA-owned state may be mutated here.
+            return
 
     def _release_conversion(self, future: Future[bytes]) -> None:
         """Release the active conversion slot on the HA event loop."""

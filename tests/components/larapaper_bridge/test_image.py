@@ -781,6 +781,34 @@ async def test_image_resources_reuse_and_final_stop_cleanup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_conversion_completion_skips_release_when_loop_is_closed() -> None:
+    class FakeBus:
+        def async_listen_once(self, _event: str, _callback: object) -> None:
+            return None
+
+    class FakeHass:
+        bus = FakeBus()
+
+    class ClosedLoop:
+        def call_soon_threadsafe(self, *_args: object) -> None:
+            raise RuntimeError("event loop is closed")
+
+    resources = ImageResources(
+        FakeHass(),  # type: ignore[arg-type]
+        session=FakeImageSession([]),
+        executor=ThreadPoolExecutor(max_workers=1),
+    )
+    future = object()
+    resources._conversion_future = future  # type: ignore[assignment]
+    resources._loop = ClosedLoop()  # type: ignore[assignment]
+
+    resources._conversion_done(future)  # type: ignore[arg-type]
+
+    assert resources._conversion_future is future
+    await resources._async_stop(None)
+
+
+@pytest.mark.asyncio
 async def test_image_operation_holds_admission_until_abandoned_worker_finishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
