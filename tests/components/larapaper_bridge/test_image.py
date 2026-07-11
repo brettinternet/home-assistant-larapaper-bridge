@@ -12,6 +12,7 @@ from custom_components.larapaper_bridge.image import (
     ImageSSRFError,
     ImageTransportError,
     ImageURLResolutionError,
+    PNG_MAGIC,
     PolicyResolver,
     _REQUEST_ORIGIN,
     async_fetch_image,
@@ -22,6 +23,17 @@ from custom_components.larapaper_bridge.image import (
 
 
 BASE = "https://Larapaper.example/bridge///"
+PNG_BYTES = PNG_MAGIC + b"valid"
+BMP_BYTES = b"BM" + b"valid"
+
+
+class FakeContent:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+
+    async def iter_chunked(self, _size: int):
+        for chunk in self.chunks:
+            yield chunk
 
 
 class FakeResponse:
@@ -30,13 +42,16 @@ class FakeResponse:
         status: int,
         *,
         headers: dict[str, str] | None = None,
-        body: bytes = b"image",
+        body: bytes = PNG_BYTES,
         read_error: BaseException | None = None,
+        stream_chunks: list[bytes] | None = None,
     ) -> None:
         self.status = status
         self.headers = headers or {}
         self._body = body
         self._read_error = read_error
+        self.read_calls = 0
+        self.content = FakeContent(stream_chunks) if stream_chunks is not None else None
 
     async def __aenter__(self) -> FakeResponse:
         return self
@@ -45,6 +60,7 @@ class FakeResponse:
         return None
 
     async def read(self) -> bytes:
+        self.read_calls += 1
         if self._read_error is not None:
             raise self._read_error
         return self._body
@@ -300,14 +316,14 @@ async def test_transport_follows_supported_redirects_without_forwarding_headers(
     session = FakeImageSession(
         [
             FakeResponse(status, headers={"Location": "/next"}),
-            FakeResponse(200, headers={"Content-Type": "image/png"}, body=b"png"),
+            FakeResponse(200, headers={"Content-Type": "image/png"}, body=PNG_BYTES),
         ]
     )
 
     result = await async_fetch_image(session, "https://images.example/start")
 
     assert result.url == "https://images.example/next"
-    assert result.body == b"png"
+    assert result.body == PNG_BYTES
     assert [call[0] for call in session.calls] == [
         "https://images.example/start",
         "https://images.example/next",
@@ -323,7 +339,7 @@ async def test_transport_resolves_relative_redirects_and_allows_three_hops() -> 
             FakeResponse(301, headers={"Location": "../two"}),
             FakeResponse(302, headers={"Location": "//cdn.example/three"}),
             FakeResponse(307, headers={"Location": "four?filename=screen.bmp"}),
-            FakeResponse(200, body=b"done"),
+            FakeResponse(200, body=PNG_BYTES),
         ]
     )
 
@@ -379,6 +395,101 @@ async def test_transport_rejects_fourth_redirect() -> None:
         await async_fetch_image(session, "https://images.example/start")
 
     assert len(session.calls) == 4
+
+
+@pytest.mark.parametrize(
+    ("headers", "body"),
+    [
+        ({}, PNG_BYTES),
+        ({"Content-Type": "application/octet-stream"}, BMP_BYTES),
+        ({"Content-Type": "IMAGE/PNG; charset=utf-8"}, PNG_BYTES),
+        ({"Content-Type": 'image/bmp; name="screen.bmp"'}, BMP_BYTES),
+    ],
+)
+@pytest.mark.asyncio
+async def test_transport_accepts_supported_magic_and_parameterized_types(
+    headers: dict[str, str], body: bytes
+) -> None:
+    response = FakeResponse(200, headers=headers, body=body)
+
+    result = await async_fetch_image(FakeImageSession([response]), "https://images.example/image")
+
+    assert result.body == body
+
+
+@pytest.mark.parametrize(
+    ("headers", "body"),
+    [
+        ({}, b"not-an-image"),
+        ({"Content-Type": "application/octet-stream"}, b"not-an-image"),
+        ({"Content-Type": "image/png"}, BMP_BYTES),
+        ({"Content-Type": "image/bmp"}, PNG_BYTES),
+        ({"Content-Type": "text/html"}, PNG_BYTES),
+        ({"Content-Type": "image/png;"}, PNG_BYTES),
+        ({"Content-Type": "image/png; charset"}, PNG_BYTES),
+        ({"Content-Type": 'image/png; charset="unterminated'}, PNG_BYTES),
+    ],
+)
+@pytest.mark.asyncio
+async def test_transport_rejects_unsupported_or_malformed_content_types(
+    headers: dict[str, str], body: bytes
+) -> None:
+    with pytest.raises(ImageTransportError):
+        await async_fetch_image(
+            FakeImageSession([FakeResponse(200, headers=headers, body=body)]),
+            "https://images.example/image",
+        )
+
+
+@pytest.mark.asyncio
+async def test_transport_rejects_content_length_before_reading_body() -> None:
+    response = FakeResponse(
+        200,
+        headers={"Content-Length": "11"},
+        body=PNG_BYTES,
+    )
+
+    with pytest.raises(ImageTransportError, match="byte limit"):
+        await async_fetch_image(
+            FakeImageSession([response]),
+            "https://images.example/image",
+            max_image_bytes=10,
+        )
+
+    assert response.read_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_transport_rejects_streamed_body_as_soon_as_limit_is_exceeded() -> None:
+    response = FakeResponse(
+        200,
+        stream_chunks=[PNG_MAGIC, b"1234", b"5678"],
+    )
+
+    with pytest.raises(ImageTransportError, match="byte limit"):
+        await async_fetch_image(
+            FakeImageSession([response]),
+            "https://images.example/image",
+            max_image_bytes=len(PNG_MAGIC) + 5,
+        )
+
+
+@pytest.mark.asyncio
+async def test_transport_accepts_body_at_inclusive_limit() -> None:
+    result = await async_fetch_image(
+        FakeImageSession(
+            [
+                FakeResponse(
+                    200,
+                    stream_chunks=[PNG_MAGIC, b"1234"],
+                )
+            ]
+        ),
+        "https://images.example/image",
+        max_image_bytes=len(PNG_MAGIC) + 4,
+    )
+
+    assert result.body == PNG_MAGIC + b"1234"
 
 
 @pytest.mark.asyncio

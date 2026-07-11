@@ -12,6 +12,9 @@ from collections.abc import AsyncIterator, Iterable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
+import re
+
+from .const import DEFAULT_MAX_IMAGE_BYTES
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
 from aiohttp import ClientTimeout, TCPConnector
@@ -43,6 +46,12 @@ class ImageResponse:
     headers: Mapping[str, str]
     body: bytes
 
+
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+BMP_MAGIC = b"BM"
+MAX_BODY_CHUNK_BYTES = 64 * 1024
+_TOKEN_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 IMAGE_REQUEST_TIMEOUT_SECONDS = 10.0
@@ -203,6 +212,103 @@ async def _image_request(
     yield request
 
 
+
+def _header_value(headers: Mapping[str, str], name: str) -> str | None:
+    """Read one response header without depending on mapping case."""
+    name = name.lower()
+    for key, value in headers.items():
+        if key.lower() == name:
+            return value
+    return None
+
+
+def _valid_quoted_parameter(value: str) -> bool:
+    """Return whether a content-type quoted parameter is well formed."""
+    if len(value) < 2 or value[0] != '"' or value[-1] != '"':
+        return False
+    escaped = False
+    for char in value[1:-1]:
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif ord(char) < 0x20 or ord(char) == 0x7F:
+            return False
+    return not escaped
+
+
+def _declared_media_type(headers: Mapping[str, str]) -> str | None:
+    """Normalize and validate Content-Type, stripping valid parameters."""
+    value = _header_value(headers, "Content-Type")
+    if value is None:
+        return None
+    parts = value.split(";")
+    media_type = parts[0].strip().lower()
+    type_parts = media_type.split("/")
+    if len(type_parts) != 2 or not all(_TOKEN_RE.fullmatch(part) for part in type_parts):
+        raise ImageTransportError("image content type was invalid")
+    for parameter in parts[1:]:
+        name_value = parameter.strip().split("=", 1)
+        if len(name_value) != 2 or not _TOKEN_RE.fullmatch(name_value[0].strip()):
+            raise ImageTransportError("image content type was invalid")
+        parameter_value = name_value[1].strip()
+        if not (
+            _TOKEN_RE.fullmatch(parameter_value)
+            or _valid_quoted_parameter(parameter_value)
+        ):
+            raise ImageTransportError("image content type was invalid")
+    return media_type
+
+
+async def _read_limited_body(response: Any, limit: int) -> bytes:
+    """Read one response body while enforcing its encoded-byte limit."""
+    headers = response.headers
+    content_length = _header_value(headers, "Content-Length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length.strip())
+        except (AttributeError, TypeError, ValueError):
+            raise ImageTransportError("image content length was invalid") from None
+        if declared_length < 0 or declared_length > limit:
+            raise ImageTransportError("image response exceeded the byte limit")
+
+    content = getattr(response, "content", None)
+    iter_chunked = getattr(content, "iter_chunked", None)
+    if callable(iter_chunked):
+        body = bytearray()
+        async for chunk in iter_chunked(MAX_BODY_CHUNK_BYTES):
+            if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                raise ImageTransportError("image response body was invalid")
+            if len(body) + len(chunk) > limit:
+                raise ImageTransportError("image response exceeded the byte limit")
+            body.extend(chunk)
+        return bytes(body)
+
+    body = await response.read()
+    if not isinstance(body, (bytes, bytearray, memoryview)) or len(body) > limit:
+        raise ImageTransportError("image response exceeded the byte limit")
+    return bytes(body)
+
+
+def _validate_image_bytes(body: bytes, headers: Mapping[str, str]) -> None:
+    """Enforce the declared media type and image magic-byte contract."""
+    media_type = _declared_media_type(headers)
+    is_png = body.startswith(PNG_MAGIC)
+    is_bmp = body.startswith(BMP_MAGIC)
+    if media_type is None or media_type == "application/octet-stream":
+        if not (is_png or is_bmp):
+            raise ImageTransportError("image bytes did not match a supported format")
+        return
+    if media_type == "image/png":
+        if not is_png:
+            raise ImageTransportError("image bytes did not match PNG")
+        return
+    if media_type == "image/bmp":
+        if not is_bmp:
+            raise ImageTransportError("image bytes did not match BMP")
+        return
+    raise ImageTransportError("image content type was unsupported")
+
 async def async_fetch_image(
     session: Any,
     image_url: str,
@@ -211,6 +317,7 @@ async def async_fetch_image(
     image_base_url: str | None = None,
     timeout_seconds: float = IMAGE_REQUEST_TIMEOUT_SECONDS,
     max_redirects: int = MAX_IMAGE_REDIRECTS,
+    max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
 ) -> ImageResponse:
     """Fetch one image response with bounded, policy-aware redirects.
 
@@ -223,6 +330,12 @@ async def async_fetch_image(
         raise ValueError("timeout_seconds must be positive")
     if not isinstance(max_redirects, int) or isinstance(max_redirects, bool) or max_redirects < 0:
         raise ValueError("max_redirects must be non-negative")
+    if (
+        not isinstance(max_image_bytes, int)
+        or isinstance(max_image_bytes, bool)
+        or max_image_bytes <= 0
+    ):
+        raise ValueError("max_image_bytes must be positive")
 
     if larapaper_base_url is not None:
         current_url = resolve_image_url(
@@ -253,12 +366,13 @@ async def async_fetch_image(
                         continue
                     if not 200 <= status < 300:
                         raise ImageTransportError("image request returned an unexpected status")
-                    body = await response.read()
+                    body = await _read_limited_body(response, max_image_bytes)
+                    _validate_image_bytes(body, response.headers)
                     return ImageResponse(
                         url=current_url,
                         status=status,
                         headers=dict(response.headers),
-                        body=bytes(body),
+                        body=body,
                     )
     except asyncio.CancelledError:
         raise
