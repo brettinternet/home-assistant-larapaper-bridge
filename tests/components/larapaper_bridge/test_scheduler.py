@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from custom_components.larapaper_bridge.client import DisplayResult
+from custom_components.larapaper_bridge.client import DisplayResult, LarapaperClientError
 from custom_components.larapaper_bridge.runtime import RuntimeHolder
 from custom_components.larapaper_bridge.scheduler import (
     CacheRecord,
@@ -52,10 +52,13 @@ class FakeDisplay:
         self.clock = clock
         self.calls: list[tuple[str, str]] = []
         self.settle_delay = 0.0
+        self.failure: LarapaperClientError | None = None
 
     async def async_display(self, mac: str, api_key: str) -> DisplayResult:
         self.calls.append((mac, api_key))
         self.clock.value += self.settle_delay
+        if self.failure is not None:
+            raise self.failure
         return DisplayResult("/image.png", 60.0)
 
 
@@ -81,6 +84,53 @@ async def test_one_cycle_calls_display_once_and_anchors_deadline_at_settlement(r
     assert display.calls == [(MAC, "secret")]
     assert runtime.cycle_generation == 1
     assert scheduler.next_display_deadline == 167.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", ["invalid_display_response", "display_failed"])
+async def test_display_failure_uses_prior_interval_and_records_error(runtime, error_code):
+    clock = FakeClock()
+    display = FakeDisplay(clock)
+    scheduler = DisplayScheduler(
+        runtime, api_key="secret", display_client=display, clock=clock
+    )
+
+    assert await scheduler.async_run_cycle() == DisplayResult("/image.png", 60.0)
+
+    display.failure = LarapaperClientError(error_code, "safe failure")
+    display.settle_delay = 7.0
+    assert await scheduler.async_run_cycle() is None
+
+    assert display.calls == [(MAC, "secret"), (MAC, "secret")]
+    assert scheduler.last_error == error_code
+    assert scheduler.next_display_deadline == 167.0
+
+
+@pytest.mark.asyncio
+async def test_scheduler_continues_after_display_failure(runtime):
+    clock = FakeClock()
+    display = FakeDisplay(clock)
+    scheduler = DisplayScheduler(
+        runtime, api_key="secret", display_client=display, clock=clock
+    )
+    display.failure = LarapaperClientError("display_failed", "safe failure")
+    sleep_calls: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+        if len(sleep_calls) == 1:
+            display.failure = None
+            clock.value += delay
+            return
+        raise asyncio.CancelledError
+
+    scheduler.sleep = sleep
+    task = scheduler.async_start()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(display.calls) == 2
+    assert sleep_calls == [60.0, 60.0]
 
 
 @pytest.mark.asyncio

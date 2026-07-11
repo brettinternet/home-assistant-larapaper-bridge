@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, Protocol
 
-from .client import DisplayResult
+from .client import DisplayResult, LarapaperClientError
+from .const import CONF_MIN_POLL_SECONDS
 from .runtime import EntryRuntime
 
 ImageErrorCode = Literal["fetch", "validation", "conversion"]
@@ -115,17 +116,35 @@ class DisplayScheduler:
         self.sleep = sleep
         self.next_display_deadline: float | None = None
         self.last_display_result: DisplayResult | None = None
+        self.last_error: str | None = None
+        self._last_effective_interval = float(
+            runtime.config_entry.data[CONF_MIN_POLL_SECONDS]
+        )
         self._task: asyncio.Task[None] | None = None
 
     async def async_run_cycle(self) -> DisplayResult | None:
-        """Run exactly one display request and settle its next deadline."""
+        """Run one display request and settle its next deadline."""
         token = self.runtime.begin_cycle()
-        result = await self.display_client.async_display(self.runtime.mac, self.api_key)
+        try:
+            result = await self.display_client.async_display(
+                self.runtime.mac, self.api_key
+            )
+        except asyncio.CancelledError:
+            raise
+        except LarapaperClientError as error:
+            settled_at = self.clock()
+            if not self.runtime.is_token_current(token):
+                return None
+            self.last_error = error.code
+            self.next_display_deadline = settled_at + self._last_effective_interval
+            return None
+
         settled_at = self.clock()
         if not self.runtime.is_token_current(token):
             return None
         self.last_display_result = result
-        self.next_display_deadline = settled_at + result.effective_interval_seconds
+        self._last_effective_interval = result.effective_interval_seconds
+        self.next_display_deadline = settled_at + self._last_effective_interval
         return result
 
     def async_start(self) -> asyncio.Task[None]:
@@ -137,8 +156,8 @@ class DisplayScheduler:
 
     async def _run(self) -> None:
         while self.runtime.is_current():
-            result = await self.async_run_cycle()
-            if result is None or self.next_display_deadline is None:
+            await self.async_run_cycle()
+            if not self.runtime.is_current() or self.next_display_deadline is None:
                 return
             await self.sleep(max(0.0, self.next_display_deadline - self.clock()))
 
