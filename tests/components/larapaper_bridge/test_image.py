@@ -4,21 +4,31 @@ from __future__ import annotations
 
 import asyncio
 import socket
-
+import random
+import struct
+import zlib
 import pytest
 
 from custom_components.larapaper_bridge.image import (
+    BMP_MAGIC,
+    MAX_DECODED_DIMENSION,
+    MAX_DECODED_PIXELS,
+    ImageConversionError,
+    ImageDimensions,
     ImageNetworkPolicy,
     ImageSSRFError,
     ImageTransportError,
     ImageURLResolutionError,
+    ImageValidationError,
     PNG_MAGIC,
     PolicyResolver,
     _REQUEST_ORIGIN,
     async_fetch_image,
+    convert_image_to_png,
     create_image_connector,
     image_origin,
     resolve_image_url,
+    validate_image_dimensions,
 )
 
 
@@ -34,6 +44,56 @@ class FakeContent:
     async def iter_chunked(self, _size: int):
         for chunk in self.chunks:
             yield chunk
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(data))
+        + chunk_type
+        + data
+        + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
+    )
+
+
+def _png_bytes(width: int, height: int, *, pixels: bool = True) -> bytes:
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    if pixels:
+        raw = b"".join(
+            b"\x00" + (b"\x20\x80\xe0\xff" * width) for _ in range(height)
+        )
+        idat = zlib.compress(raw)
+    else:
+        idat = b""
+    return PNG_MAGIC + _png_chunk(b"IHDR", ihdr) + _png_chunk(
+        b"IDAT", idat
+    ) + _png_chunk(b"IEND", b"")
+
+
+def _bmp_bytes(
+    width: int, height: int, *, pixels: bool = True, top_down: bool = False
+) -> bytes:
+    row_stride = (width * 3 + 3) & ~3
+    pixel_data = (
+        bytes((index * 37 + 11) % 256 for index in range(row_stride * height))
+        if pixels
+        else b""
+    )
+    signed_height = -height if top_down else height
+    dib = struct.pack(
+        "<IiiHHIIiiII",
+        40,
+        width,
+        signed_height,
+        1,
+        24,
+        0,
+        len(pixel_data),
+        0,
+        0,
+        0,
+        0,
+    )
+    file_size = 14 + len(dib) + len(pixel_data)
+    header = b"BM" + struct.pack("<IHHI", file_size, 0, 0, 54)
+    return header + dib + pixel_data
 
 
 class FakeResponse:
@@ -74,6 +134,154 @@ class FakeImageSession:
     def get(self, url: str, **kwargs: object) -> FakeResponse:
         self.calls.append((url, kwargs))
         return self.responses.pop(0)
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "valid"),
+    [
+        (1, 1, True),
+        (MAX_DECODED_DIMENSION, MAX_DECODED_PIXELS // MAX_DECODED_DIMENSION, True),
+        (MAX_DECODED_DIMENSION, MAX_DECODED_PIXELS // MAX_DECODED_DIMENSION + 1, False),
+        (MAX_DECODED_DIMENSION + 1, 1, False),
+        (0, 1, False),
+    ],
+)
+def test_png_dimensions_are_structural_and_bounded(
+    width: int, height: int, valid: bool
+) -> None:
+    body = _png_bytes(width, height, pixels=False)
+    if valid:
+        assert validate_image_dimensions(body) == ImageDimensions(
+            "png", width, height
+        )
+    else:
+        with pytest.raises(ImageValidationError):
+            validate_image_dimensions(body)
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "valid"),
+    [
+        (1, 1, True),
+        (MAX_DECODED_DIMENSION, MAX_DECODED_PIXELS // MAX_DECODED_DIMENSION, True),
+        (MAX_DECODED_DIMENSION, MAX_DECODED_PIXELS // MAX_DECODED_DIMENSION + 1, False),
+        (MAX_DECODED_DIMENSION + 1, 1, False),
+        (0, 1, False),
+    ],
+)
+def test_bmp_dimensions_handle_signed_height_and_bounds(
+    width: int, height: int, valid: bool
+) -> None:
+    body = _bmp_bytes(width, height, pixels=False)
+    if valid:
+        assert validate_image_dimensions(body) == ImageDimensions(
+            "bmp", width, height
+        )
+        top_down = _bmp_bytes(width, height, pixels=False, top_down=True)
+        assert validate_image_dimensions(top_down) == ImageDimensions(
+            "bmp", width, height
+        )
+    else:
+        with pytest.raises(ImageValidationError):
+            validate_image_dimensions(body)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        PNG_MAGIC,
+        _png_bytes(1, 1, pixels=False)[:-1],
+        _png_bytes(1, 1, pixels=False)[:29]
+        + bytes([_png_bytes(1, 1, pixels=False)[29] ^ 1])
+        + _png_bytes(1, 1, pixels=False)[30:],
+        _bmp_bytes(1, 1, pixels=False)[:30],
+    ],
+)
+def test_image_dimension_preflight_rejects_truncated_or_corrupt_headers(
+    body: bytes,
+) -> None:
+    with pytest.raises(ImageValidationError):
+        validate_image_dimensions(body)
+
+
+def test_valid_png_is_passed_through_without_pillow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from custom_components.larapaper_bridge import image as image_module
+
+    monkeypatch.setattr(
+        image_module.Image,
+        "open",
+        lambda *_args, **_kwargs: pytest.fail("PNG must not use Pillow"),
+    )
+    body = _png_bytes(2, 2)
+
+    assert convert_image_to_png(body, max_image_bytes=100_000) is body
+
+
+def test_bmp_is_decoded_and_converted_to_png() -> None:
+    body = _bmp_bytes(3, 2)
+
+    converted = convert_image_to_png(body, max_image_bytes=100_000)
+
+    assert isinstance(converted, bytes)
+    assert converted.startswith(PNG_MAGIC)
+    assert validate_image_dimensions(converted) == ImageDimensions("png", 3, 2)
+
+
+def test_truncated_bmp_is_rejected_after_header_preflight() -> None:
+    with pytest.raises(ImageValidationError):
+        convert_image_to_png(
+            _bmp_bytes(3, 2, pixels=False),
+            max_image_bytes=1_000,
+        )
+
+
+@pytest.mark.parametrize("bomb", [False, True])
+def test_pillow_bomb_warning_and_error_are_hard_validation_failures(
+    monkeypatch: pytest.MonkeyPatch, bomb: bool
+) -> None:
+    from custom_components.larapaper_bridge import image as image_module
+
+    if bomb:
+        def open_bomb(*_args: object, **_kwargs: object) -> object:
+            raise image_module.Image.DecompressionBombError
+    else:
+        def open_bomb(*_args: object, **_kwargs: object) -> object:
+            image_module.warnings.warn(
+                "bomb",
+                image_module.Image.DecompressionBombWarning,
+            )
+            raise AssertionError("warning should become an exception")
+
+    monkeypatch.setattr(image_module.Image, "open", open_bomb)
+    with pytest.raises(ImageValidationError):
+        convert_image_to_png(_bmp_bytes(1, 1), max_image_bytes=1_000)
+
+
+def test_converted_output_limit_is_checked_before_publication() -> None:
+    body = bytearray(_bmp_bytes(64, 64))
+    body[54:] = random.Random(17).randbytes(len(body) - 54)
+    body = bytes(body)
+    converted = convert_image_to_png(body, max_image_bytes=1_000_000)
+    assert len(converted) > len(body)
+
+    with pytest.raises(ImageConversionError):
+        convert_image_to_png(
+            body,
+            max_image_bytes=max(len(body), len(converted) - 1),
+        )
+
+
+def test_conversion_does_not_write_to_filesystem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_open(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("image conversion must not open filesystem paths")
+
+    monkeypatch.setattr("builtins.open", fail_open)
+    converted = convert_image_to_png(_bmp_bytes(2, 2), max_image_bytes=100_000)
+    assert converted.startswith(PNG_MAGIC)
 
 
 @pytest.mark.parametrize(

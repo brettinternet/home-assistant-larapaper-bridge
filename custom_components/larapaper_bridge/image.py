@@ -5,22 +5,29 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-import math
+import io
 import ipaddress
+import math
+import re
 import socket
+import struct
+import threading
+import warnings
+import zlib
 from collections.abc import AsyncIterator, Iterable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any
-import re
-
-from .const import DEFAULT_MAX_IMAGE_BYTES
+from typing import Any, Literal
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
 from aiohttp import ClientTimeout, TCPConnector
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.client_exceptions import ClientConnectorError
 from aiohttp.resolver import DefaultResolver
+from PIL import Image, ImageFile
+from PIL import UnidentifiedImageError
+
+from .const import DEFAULT_MAX_IMAGE_BYTES
 
 
 
@@ -37,6 +44,13 @@ class ImageTransportError(OSError):
     """Raised when an image request cannot complete safely."""
 
 
+class ImageValidationError(ImageTransportError):
+    """Raised when image bytes fail structural or decoded-image validation."""
+
+
+class ImageConversionError(ImageTransportError):
+    """Raised when a validated BMP cannot be converted to bounded PNG bytes."""
+
 @dataclass(frozen=True, slots=True)
 class ImageResponse:
     """The final response returned by the image transport."""
@@ -45,6 +59,22 @@ class ImageResponse:
     status: int
     headers: Mapping[str, str]
     body: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class ImageDimensions:
+    """Validated dimensions for one supported encoded image."""
+
+    format: Literal["png", "bmp"]
+    width: int
+    height: int
+
+
+MAX_DECODED_DIMENSION = 8192
+MAX_DECODED_PIXELS = 16_777_216
+_PNG_IHDR_LENGTH = 13
+_BMP_FILE_HEADER_BYTES = 14
+_PILLOW_LOCK = threading.Lock()
 
 
 
@@ -308,6 +338,191 @@ def _validate_image_bytes(body: bytes, headers: Mapping[str, str]) -> None:
             raise ImageTransportError("image bytes did not match BMP")
         return
     raise ImageTransportError("image content type was unsupported")
+
+
+def _checked_dimensions(
+    image_format: Literal["png", "bmp"], width: int, height: int
+) -> ImageDimensions:
+    """Apply the fixed axis and decoded-pixel limits without overflow."""
+    if (
+        not isinstance(width, int)
+        or not isinstance(height, int)
+        or width <= 0
+        or height <= 0
+        or width > MAX_DECODED_DIMENSION
+        or height > MAX_DECODED_DIMENSION
+        or width > MAX_DECODED_PIXELS // height
+    ):
+        raise ImageValidationError("image dimensions exceeded the decode limits")
+    return ImageDimensions(image_format, width, height)
+
+
+def _parse_png_dimensions(body: bytes) -> ImageDimensions:
+    """Validate PNG chunks and return dimensions without Pillow."""
+    if len(body) < len(PNG_MAGIC) or not body.startswith(PNG_MAGIC):
+        raise ImageValidationError("image was not a PNG")
+
+    offset = len(PNG_MAGIC)
+    dimensions: ImageDimensions | None = None
+    saw_idat = False
+    while offset < len(body):
+        if len(body) - offset < 12:
+            raise ImageValidationError("PNG chunk was truncated")
+        chunk_length = struct.unpack_from(">I", body, offset)[0]
+        chunk_type = body[offset + 4 : offset + 8]
+        if not all(
+            65 <= byte <= 90 or 97 <= byte <= 122 for byte in chunk_type
+        ):
+            raise ImageValidationError("PNG chunk type was invalid")
+        data_start = offset + 8
+        data_end = data_start + chunk_length
+        chunk_end = data_end + 4
+        if data_end < data_start or chunk_end > len(body):
+            raise ImageValidationError("PNG chunk was truncated")
+        chunk_data = body[data_start:data_end]
+        expected_crc = struct.unpack_from(">I", body, data_end)[0]
+        actual_crc = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            raise ImageValidationError("PNG chunk checksum was invalid")
+
+        if dimensions is None:
+            if chunk_type != b"IHDR" or chunk_length != _PNG_IHDR_LENGTH:
+                raise ImageValidationError("PNG IHDR was invalid")
+            width, height = struct.unpack_from(">II", chunk_data)
+            dimensions = _checked_dimensions("png", width, height)
+        elif chunk_type == b"IHDR":
+            raise ImageValidationError("PNG contained multiple IHDR chunks")
+
+        if chunk_type == b"IDAT":
+            saw_idat = True
+        if chunk_type == b"IEND":
+            if chunk_length != 0 or not saw_idat or chunk_end != len(body):
+                raise ImageValidationError("PNG ended before a complete image")
+            return dimensions
+        offset = chunk_end
+
+    raise ImageValidationError("PNG did not contain a complete IEND chunk")
+
+
+def _parse_bmp_dimensions(body: bytes) -> ImageDimensions:
+    """Validate the BMP header and return signed-height-safe dimensions."""
+    if len(body) < _BMP_FILE_HEADER_BYTES or not body.startswith(BMP_MAGIC):
+        raise ImageValidationError("image was not a BMP")
+    pixel_offset = struct.unpack_from("<I", body, 10)[0]
+    if len(body) < _BMP_FILE_HEADER_BYTES + 4:
+        raise ImageValidationError("BMP DIB header was truncated")
+    dib_size = struct.unpack_from("<I", body, _BMP_FILE_HEADER_BYTES)[0]
+
+    if dib_size == 12:
+        dib_end = _BMP_FILE_HEADER_BYTES + dib_size
+        if len(body) < dib_end:
+            raise ImageValidationError("BMP DIB header was truncated")
+        width, height = struct.unpack_from("<HH", body, 18)
+    elif dib_size >= 40:
+        dib_end = _BMP_FILE_HEADER_BYTES + dib_size
+        if len(body) < dib_end:
+            raise ImageValidationError("BMP DIB header was truncated")
+        width, signed_height = struct.unpack_from("<ii", body, 18)
+        if signed_height == 0:
+            raise ImageValidationError("BMP height was invalid")
+        height = abs(signed_height)
+    else:
+        raise ImageValidationError("BMP DIB header was unsupported")
+
+    if pixel_offset < dib_end:
+        raise ImageValidationError("BMP pixel offset was invalid")
+    if pixel_offset > len(body):
+        raise ImageValidationError("BMP pixel data was truncated")
+    return _checked_dimensions("bmp", width, height)
+
+
+def validate_image_dimensions(body: bytes) -> ImageDimensions:
+    """Validate supported image structure and bounded decoded dimensions."""
+    if not isinstance(body, bytes):
+        raise ImageValidationError("image bytes must be immutable bytes")
+    if body.startswith(PNG_MAGIC):
+        return _parse_png_dimensions(body)
+    if body.startswith(BMP_MAGIC):
+        return _parse_bmp_dimensions(body)
+    raise ImageValidationError("image format was unsupported")
+
+
+def _validate_max_image_bytes(max_image_bytes: int) -> None:
+    """Validate the configured encoded and converted byte limit."""
+    if (
+        not isinstance(max_image_bytes, int)
+        or isinstance(max_image_bytes, bool)
+        or max_image_bytes <= 0
+    ):
+        raise ValueError("max_image_bytes must be positive")
+
+
+def convert_image_to_png(body: bytes, *, max_image_bytes: int) -> bytes:
+    """Return a bounded PNG, using Pillow only for BMP conversion."""
+    _validate_max_image_bytes(max_image_bytes)
+    if len(body) > max_image_bytes:
+        raise ImageValidationError("image response exceeded the byte limit")
+    dimensions = validate_image_dimensions(body)
+    if dimensions.format == "png":
+        return body
+
+    previous_truncated_setting = ImageFile.LOAD_TRUNCATED_IMAGES
+    try:
+        with _PILLOW_LOCK:
+            ImageFile.LOAD_TRUNCATED_IMAGES = False
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                try:
+                    with Image.open(io.BytesIO(body)) as decoded:
+                        if decoded.format != "BMP":
+                            raise ImageValidationError("image format was not BMP")
+                        loaded_dimensions = _checked_dimensions(
+                            "bmp", *decoded.size
+                        )
+                        if loaded_dimensions != dimensions:
+                            raise ImageValidationError(
+                                "BMP dimensions changed during decode"
+                            )
+                        decoded.load()
+                        loaded_dimensions = _checked_dimensions(
+                            "bmp", *decoded.size
+                        )
+                        if loaded_dimensions != dimensions:
+                            raise ImageValidationError(
+                                "BMP dimensions changed during decode"
+                            )
+                        try:
+                            converted = decoded.convert("RGB")
+                            output = io.BytesIO()
+                            converted.save(output, format="PNG")
+                        except ImageValidationError:
+                            raise
+                        except Exception as error:
+                            raise ImageConversionError(
+                                "BMP conversion failed"
+                            ) from error
+                        finally:
+                            if "converted" in locals():
+                                converted.close()
+                        png_bytes = output.getvalue()
+                except ImageValidationError:
+                    raise
+                except (
+                    Image.DecompressionBombError,
+                    Image.DecompressionBombWarning,
+                    UnidentifiedImageError,
+                    EOFError,
+                    OSError,
+                    SyntaxError,
+                    ValueError,
+                ) as error:
+                    raise ImageValidationError("image decode failed") from error
+    finally:
+        ImageFile.LOAD_TRUNCATED_IMAGES = previous_truncated_setting
+
+    if len(png_bytes) > max_image_bytes:
+        raise ImageConversionError("converted PNG exceeded the byte limit")
+    return bytes(png_bytes)
 
 async def async_fetch_image(
     session: Any,
