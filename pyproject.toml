@@ -1,0 +1,9 @@
+[project]
+name = "home-assistant-larapaper-bridge"
+version = "0.1.0"
+description = "A Home Assistant integration for Larapaper displays."
+requires-python = ">=3.14,<3.15"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

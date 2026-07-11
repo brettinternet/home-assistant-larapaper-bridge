@@ -1,0 +1,11 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Larapaper Bridge",
+        "description": "Configure a Larapaper display.",
+        "data": {}
+      }
+    }
+  }
+}
