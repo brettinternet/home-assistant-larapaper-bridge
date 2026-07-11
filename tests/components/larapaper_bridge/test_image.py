@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import socket
 import pytest
 
 from custom_components.larapaper_bridge.image import (
+    ImageNetworkPolicy,
+    ImageSSRFError,
     ImageURLResolutionError,
+    PolicyResolver,
+    _REQUEST_ORIGIN,
+    create_image_connector,
+    image_origin,
     resolve_image_url,
 )
 
@@ -103,3 +110,143 @@ def test_rejects_invalid_image_base_override(image_base_url: str) -> None:
             larapaper_base_url=BASE,
             image_base_url=image_base_url,
         )
+
+
+class FakeResolver:
+    """Return representative aiohttp ResolveResult dictionaries."""
+
+    def __init__(self, addresses: list[str]) -> None:
+        self.addresses = addresses
+        self.closed = False
+
+    async def resolve(
+        self, host: str, port: int, family: socket.AddressFamily
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "hostname": host,
+                "host": address,
+                "port": port,
+                "family": family,
+                "proto": 0,
+                "flags": 0,
+            }
+            for address in self.addresses
+        ]
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _resolver(
+    addresses: list[str],
+    *,
+    request_url: str | None = None,
+) -> tuple[PolicyResolver, FakeResolver]:
+    raw = FakeResolver(addresses)
+    policy = ImageNetworkPolicy.from_urls("https://private.example/bridge/")
+    return (
+        PolicyResolver(
+            raw,
+            allowed_private_origins=policy.allowed_private_origins,
+            request_origin=image_origin(request_url) if request_url else None,
+        ),
+        raw,
+    )
+
+
+@pytest.mark.asyncio
+async def test_connection_policy_allows_exact_configured_private_https_origin() -> None:
+    resolver, _raw = _resolver(
+        ["192.168.1.20"],
+        request_url="https://private.example/bridge/image.png",
+    )
+    results = await resolver.resolve("private.example", 443, socket.AF_UNSPEC)
+    assert results[0]["host"] == "192.168.1.20"
+
+
+@pytest.mark.asyncio
+async def test_connection_policy_rejects_same_private_authority_on_http() -> None:
+    resolver, _raw = _resolver(
+        ["192.168.1.20"],
+        request_url="http://private.example/bridge/image.png",
+    )
+    with pytest.raises(ImageSSRFError):
+        await resolver.resolve("private.example", 80, socket.AF_UNSPEC)
+
+
+@pytest.mark.asyncio
+async def test_connection_policy_accepts_only_global_unicast_addresses() -> None:
+    resolver, _raw = _resolver(
+        ["93.184.216.34"],
+        request_url="https://unconfigured.example/image.png",
+    )
+    results = await resolver.resolve("unconfigured.example", 443, socket.AF_UNSPEC)
+    assert results[0]["host"] == "93.184.216.34"
+
+    private_resolver, _raw = _resolver(
+        ["127.0.0.1"],
+        request_url="https://unconfigured.example/image.png",
+    )
+    with pytest.raises(ImageSSRFError):
+        await private_resolver.resolve("unconfigured.example", 443, socket.AF_UNSPEC)
+
+
+@pytest.mark.asyncio
+async def test_connection_policy_rejects_mixed_dns_answers() -> None:
+    resolver, _raw = _resolver(
+        ["93.184.216.34", "192.168.1.20"],
+        request_url="https://private.example/bridge/image.png",
+    )
+    with pytest.raises(ImageSSRFError, match="mixed"):
+        await resolver.resolve("private.example", 443, socket.AF_UNSPEC)
+
+
+@pytest.mark.asyncio
+async def test_connection_policy_rechecks_dns_rebinding_on_each_resolution() -> None:
+    resolver, raw = _resolver(
+        ["93.184.216.34"],
+        request_url="https://unconfigured.example/image.png",
+    )
+    await resolver.resolve("unconfigured.example", 443, socket.AF_UNSPEC)
+    raw.addresses[:] = ["10.0.0.8"]
+    with pytest.raises(ImageSSRFError):
+        await resolver.resolve("unconfigured.example", 443, socket.AF_UNSPEC)
+
+
+@pytest.mark.asyncio
+async def test_connector_disables_dns_cache_and_closes_wrapped_resolver() -> None:
+    raw = FakeResolver(["93.184.216.34"])
+    policy = ImageNetworkPolicy.from_urls("https://private.example/bridge/")
+    connector = create_image_connector(policy, resolver=raw)
+    assert connector.use_dns_cache is False
+    await connector.close()
+    assert raw.closed is True
+
+
+@pytest.mark.asyncio
+async def test_connector_validates_literal_ip_resolution_with_request_scheme() -> None:
+    raw = FakeResolver([])
+    policy = ImageNetworkPolicy.from_urls("https://127.0.0.1/bridge/")
+    connector = create_image_connector(policy, resolver=raw)
+    token = _REQUEST_ORIGIN.set(image_origin("https://127.0.0.1/bridge/image.png"))
+    try:
+        results = await connector._resolve_host("127.0.0.1", 443)
+    finally:
+        _REQUEST_ORIGIN.reset(token)
+        await connector.close()
+    assert results[0]["host"] == "127.0.0.1"
+
+
+@pytest.mark.asyncio
+async def test_connector_rejects_literal_ip_for_wrong_request_scheme() -> None:
+    raw = FakeResolver([])
+    policy = ImageNetworkPolicy.from_urls("https://127.0.0.1/bridge/")
+    connector = create_image_connector(policy, resolver=raw)
+    token = _REQUEST_ORIGIN.set(image_origin("http://127.0.0.1/bridge/image.png"))
+    try:
+        with pytest.raises(ImageSSRFError):
+            await connector._resolve_host("127.0.0.1", 80)
+    finally:
+        _REQUEST_ORIGIN.reset(token)
+        await connector.close()
