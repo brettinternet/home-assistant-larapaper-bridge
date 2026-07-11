@@ -5,8 +5,8 @@
   "config_flow": true,
   "documentation": "https://github.com/brettinternet/home-assistant-larapaper-bridge",
   "integration_type": "device",
-  "issue_tracker": "https://github.com/brettinternet/home-assistant-larapaper-bridge/issues",
   "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/brettinternet/home-assistant-larapaper-bridge/issues",
   "single_config_entry": true,
   "version": "1.0.0"
 }
