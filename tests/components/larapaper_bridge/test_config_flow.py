@@ -113,6 +113,25 @@ async def test_pending_mac_is_reused(hass):
     assert result["data"][CONF_MAC] == "AA:BB:CC:DD:EE:FF"
 
 
+async def test_configured_mac_mismatch_is_rejected_without_mutation(hass):
+    await LarapaperStore(hass).async_save_pending("AA:BB:CC:DD:EE:FF")
+    flow_id = await _start_flow(hass)
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        user_input={
+            CONF_BASE_URL: "https://example.test",
+            CONF_MAC: "11:22:33:44:55:66",
+        },
+    )
+
+    assert result["type"] is data_entry_flow.FlowResultType.FORM
+    assert result["errors"][CONF_MAC] == "mac_mismatch"
+    assert await LarapaperStore(hass).async_load() == {
+        "version": 1,
+        "mac": "AA:BB:CC:DD:EE:FF",
+    }
+
+
 async def test_duplicate_unique_id_aborts_before_store_mutation(hass):
     flow_id = await _start_flow(hass)
     result = await hass.config_entries.flow.async_configure(
