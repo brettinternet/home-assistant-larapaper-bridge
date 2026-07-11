@@ -341,6 +341,7 @@ def test_image_base_override_replaces_only_origin() -> None:
         "ftp://cdn.example/screen.png",
         "https://user:secret@cdn.example/screen.png",
         "https://cdn.example/screen.png#",
+        "https://cdn.example/screen.png?",
         "https://cdn.example/screen.png#fragment",
         "https://[invalid/screen.png",
         "https://cdn.example:invalid/screen.png",
@@ -659,6 +660,35 @@ async def test_transport_rejects_unsupported_or_malformed_content_types(
             FakeImageSession([FakeResponse(200, headers=headers, body=body)]),
             "https://images.example/image",
         )
+
+@pytest.mark.asyncio
+async def test_image_operation_classifies_content_type_failures_as_validation() -> None:
+    class FakeBus:
+        def async_listen_once(self, _event: str, _callback: object) -> None:
+            return None
+
+    class FakeHass:
+        bus = FakeBus()
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    resources = ImageResources(
+        FakeHass(),  # type: ignore[arg-type]
+        session=FakeImageSession(
+            [FakeResponse(200, headers={"Content-Type": "text/html"}, body=PNG_BYTES)]
+        ),
+        executor=executor,
+        policy=ImageNetworkPolicy.from_urls(BASE),
+    )
+    operation = BoundedImageOperation(
+        resources, larapaper_base_url=BASE, max_image_bytes=100_000
+    )
+
+    outcome = await operation.async_process(
+        "/image.png", OperationToken(0, 1)
+    )
+
+    assert outcome.error_code == "validation"
+    await resources._async_stop(None)
 
 
 @pytest.mark.asyncio

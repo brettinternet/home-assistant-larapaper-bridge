@@ -175,6 +175,8 @@ def resolve_image_url(
     base_path = base.path.rstrip("/") + "/"
 
     source = _parse_http_url(image_url, allow_relative=True)
+    if image_url.endswith("?"):
+        raise ImageURLResolutionError
     if source.scheme or source.netloc:
         resolved = _normalized_absolute_url(source, scheme=source.scheme or base.scheme)
     else:
@@ -282,17 +284,17 @@ def _declared_media_type(headers: Mapping[str, str]) -> str | None:
     media_type = parts[0].strip().lower()
     type_parts = media_type.split("/")
     if len(type_parts) != 2 or not all(_TOKEN_RE.fullmatch(part) for part in type_parts):
-        raise ImageTransportError("image content type was invalid")
+        raise ImageValidationError("image content type was invalid")
     for parameter in parts[1:]:
         name_value = parameter.strip().split("=", 1)
         if len(name_value) != 2 or not _TOKEN_RE.fullmatch(name_value[0].strip()):
-            raise ImageTransportError("image content type was invalid")
+            raise ImageValidationError("image content type was invalid")
         parameter_value = name_value[1].strip()
         if not (
             _TOKEN_RE.fullmatch(parameter_value)
             or _valid_quoted_parameter(parameter_value)
         ):
-            raise ImageTransportError("image content type was invalid")
+            raise ImageValidationError("image content type was invalid")
     return media_type
 
 
