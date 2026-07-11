@@ -13,7 +13,7 @@ def _parse_http_url(value: object, *, allow_relative: bool = False) -> SplitResu
     """Parse an HTTP(S) URL without accepting credentials or fragments."""
     if not isinstance(value, str) or not value or any(char.isspace() for char in value):
         raise ImageURLResolutionError
-    if allow_relative and value.startswith("//"):
+    if "#" in value or (allow_relative and value.startswith("//")):
         raise ImageURLResolutionError
     try:
         parsed = urlsplit(value)
@@ -72,7 +72,7 @@ def resolve_image_url(
     resolved scheme, hostname, and effective port.
     """
     base = _parse_http_url(larapaper_base_url)
-    if base.query or base.fragment:
+    if "?" in larapaper_base_url or base.query or base.fragment:
         raise ImageURLResolutionError
     base_path = base.path.rstrip("/") + "/"
 
@@ -96,7 +96,7 @@ def resolve_image_url(
     resolved_parts = _parse_http_url(resolved)
     if image_base_url is not None and image_base_url.strip():
         override = _parse_http_url(image_base_url)
-        if override.path not in ("", "/") or override.query or override.fragment:
+        if "?" in image_base_url or override.path not in ("", "/") or override.query or override.fragment:
             raise ImageURLResolutionError
         resolved = urlunsplit(
             (

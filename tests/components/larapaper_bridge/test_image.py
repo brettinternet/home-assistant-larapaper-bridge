@@ -57,6 +57,7 @@ def test_image_base_override_replaces_only_origin() -> None:
         "//cdn.example/screen.png",
         "ftp://cdn.example/screen.png",
         "https://user:secret@cdn.example/screen.png",
+        "https://cdn.example/screen.png#",
         "https://cdn.example/screen.png#fragment",
         "https://[invalid/screen.png",
         "https://cdn.example:invalid/screen.png",
@@ -71,7 +72,9 @@ def test_rejects_invalid_source_urls(image_url: str) -> None:
     "base_url",
     [
         "https://user:secret.example/bridge/",
+        "https://larapaper.example/bridge/?",
         "https://larapaper.example/bridge/?query=yes",
+        "https://larapaper.example/bridge/#",
         "https://larapaper.example/bridge/#fragment",
         "ftp://larapaper.example/bridge/",
         "https://[invalid/bridge/",
@@ -87,7 +90,9 @@ def test_rejects_invalid_larapaper_base(base_url: str) -> None:
     [
         "https://user:secret@images.example/",
         "https://images.example/assets/",
+        "https://images.example/?",
         "https://images.example/?query=yes",
+        "https://images.example/#",
         "ftp://images.example/",
     ],
 )
