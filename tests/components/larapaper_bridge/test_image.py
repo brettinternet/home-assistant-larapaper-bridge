@@ -53,6 +53,8 @@ def test_image_base_override_replaces_only_origin() -> None:
     [
         "",
         "   ",
+        "//",
+        "//cdn.example/screen.png",
         "ftp://cdn.example/screen.png",
         "https://user:secret@cdn.example/screen.png",
         "https://cdn.example/screen.png#fragment",

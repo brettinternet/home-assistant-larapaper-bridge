@@ -13,6 +13,8 @@ def _parse_http_url(value: object, *, allow_relative: bool = False) -> SplitResu
     """Parse an HTTP(S) URL without accepting credentials or fragments."""
     if not isinstance(value, str) or not value or any(char.isspace() for char in value):
         raise ImageURLResolutionError
+    if allow_relative and value.startswith("//"):
+        raise ImageURLResolutionError
     try:
         parsed = urlsplit(value)
         if not allow_relative and parsed.scheme.lower() not in {"http", "https"}:
