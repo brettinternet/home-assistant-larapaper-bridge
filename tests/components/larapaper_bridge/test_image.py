@@ -764,15 +764,45 @@ async def test_image_resources_reuse_and_final_stop_cleanup() -> None:
         session=session,
         executor=executor,  # type: ignore[arg-type]
     )
-    assert (
+    same_policy_resources = await async_get_image_resources(
+        hass,
+        # The normalized authority is the same despite a different path/case.
+        larapaper_base_url="https://larapaper.example/other/",
+        session=FakeImageSession([]),
+        executor=FakeExecutor(),  # type: ignore[arg-type]
+    )
+    assert same_policy_resources is resources
+    with pytest.raises(RuntimeError, match="policy cannot change"):
         await async_get_image_resources(
             hass,
             larapaper_base_url="https://other.example/",
             session=FakeImageSession([]),
             executor=FakeExecutor(),  # type: ignore[arg-type]
         )
-    ) is resources
     assert len(hass.bus.listeners) == 1
+
+    hass_with_image_base = FakeHass()
+    image_base_session = FakeImageSession([])
+    image_base_executor = FakeExecutor()
+    image_base_resources = await async_get_image_resources(
+        hass_with_image_base,
+        larapaper_base_url=BASE,
+        image_base_url="https://images.example/",
+        session=image_base_session,
+        executor=image_base_executor,  # type: ignore[arg-type]
+    )
+    with pytest.raises(RuntimeError, match="policy cannot change"):
+        await async_get_image_resources(
+            hass_with_image_base,
+            larapaper_base_url=BASE,
+            image_base_url=None,
+            session=FakeImageSession([]),
+            executor=FakeExecutor(),  # type: ignore[arg-type]
+        )
+    assert image_base_resources.closed is False
+    assert image_base_session.closed is False
+    assert image_base_executor.shutdown_calls == []
+    await hass_with_image_base.bus.listeners[0][1](None)  # type: ignore[misc]
 
     callback = hass.bus.listeners[0][1]
     await callback(None)  # type: ignore[misc]
@@ -797,6 +827,7 @@ async def test_conversion_completion_skips_release_when_loop_is_closed() -> None
         FakeHass(),  # type: ignore[arg-type]
         session=FakeImageSession([]),
         executor=ThreadPoolExecutor(max_workers=1),
+        policy=ImageNetworkPolicy.from_urls(BASE),
     )
     future = object()
     resources._conversion_future = future  # type: ignore[assignment]
@@ -841,7 +872,12 @@ async def test_image_operation_holds_admission_until_abandoned_worker_finishes(
     class FakeHass:
         bus = FakeBus()
 
-    resources = ImageResources(FakeHass(), session=session, executor=executor)
+    resources = ImageResources(
+        FakeHass(),
+        session=session,
+        executor=executor,
+        policy=ImageNetworkPolicy.from_urls(BASE),
+    )
     operation = BoundedImageOperation(
         resources, larapaper_base_url=BASE, max_image_bytes=100_000
     )

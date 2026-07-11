@@ -770,10 +770,12 @@ class ImageResources:
         *,
         session: Any,
         executor: ThreadPoolExecutor,
+        policy: ImageNetworkPolicy,
     ) -> None:
         self.hass = hass
         self.session = session
         self.executor = executor
+        self.policy = policy
         self._loop = asyncio.get_running_loop()
         self._conversion_future: Future[bytes] | None = None
         self._closed = False
@@ -796,6 +798,7 @@ class ImageResources:
             executor=ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="larapaper-image"
             ),
+            policy=policy,
         )
 
     @property
@@ -858,25 +861,33 @@ async def async_get_image_resources(
     from .runtime import RuntimeHolder
 
     holder = RuntimeHolder.for_hass(hass)
+    policy = ImageNetworkPolicy.from_urls(
+        larapaper_base_url, image_base_url
+    )
     resources = holder.image_resources
     if resources is not None:
         if resources.closed:
             raise RuntimeError("image resources are closed")
+        if resources.policy != policy:
+            raise RuntimeError(
+                "image network policy cannot change before final stop"
+            )
         return resources
 
-    if session is None or executor is None:
-        policy = ImageNetworkPolicy.from_urls(
-            larapaper_base_url, image_base_url
+    if session is None:
+        connector = create_image_connector(policy)
+        session = ClientSession(connector=connector, raise_for_status=False)
+    if executor is None:
+        executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="larapaper-image"
         )
-        if session is None:
-            connector = create_image_connector(policy)
-            session = ClientSession(connector=connector, raise_for_status=False)
-        if executor is None:
-            executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="larapaper-image"
-            )
 
-    resources = ImageResources(hass, session=session, executor=executor)
+    resources = ImageResources(
+        hass,
+        session=session,
+        executor=executor,
+        policy=policy,
+    )
     holder.image_resources = resources
     return resources
 
