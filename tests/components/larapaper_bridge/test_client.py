@@ -88,7 +88,15 @@ async def test_display_normalizes_image_and_clamps_interval(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("body", [{"refresh_rate": 0}, {"refresh_rate": float("nan")}, {"refresh_rate": 1, "image_url": 4}])
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"refresh_rate": 0},
+        {"refresh_rate": float("nan")},
+        {"refresh_rate": 10**1000},
+        {"refresh_rate": 1, "image_url": 4},
+    ],
+)
 async def test_display_rejects_invalid_response(
     fake_client: tuple[client.LarapaperClient, FakeSession], body: object,
 ) -> None:
@@ -163,3 +171,48 @@ async def test_cancellation_is_not_classified(monkeypatch: pytest.MonkeyPatch) -
 
     with pytest.raises(asyncio.CancelledError):
         await integration.async_display("AA:BB:CC:DD:EE:FF", "secret")
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [("not-an-object", None), (None, ValueError("invalid json"))],
+)
+async def test_setup_rejects_malformed_responses(
+    fake_client: tuple[client.LarapaperClient, FakeSession],
+    body: object,
+    error: Exception | None,
+) -> None:
+    integration, session = fake_client
+    session.response = FakeResponse(200, body, error=error)
+
+    with pytest.raises(client.LarapaperClientError) as raised:
+        await integration.async_setup("AA:BB:CC:DD:EE:FF")
+
+    assert raised.value.code == "setup_failed"
+    assert len(session.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body", "error"),
+    [
+        (302, {}, None),
+        (500, {}, None),
+        (200, None, ValueError("invalid json")),
+    ],
+)
+async def test_display_failures_are_safe_and_single_attempt(
+    fake_client: tuple[client.LarapaperClient, FakeSession],
+    status: int,
+    body: object,
+    error: Exception | None,
+) -> None:
+    integration, session = fake_client
+    session.response = FakeResponse(status, body, error=error)
+
+    with pytest.raises(client.LarapaperClientError) as raised:
+        await integration.async_display("AA:BB:CC:DD:EE:FF", "secret")
+
+    assert raised.value.code == "display_failed"
+    assert len(session.calls) == 1
+    assert "secret" not in str(raised.value)

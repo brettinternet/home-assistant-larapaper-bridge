@@ -130,7 +130,13 @@ class LarapaperClient:
             raise LarapaperClientError(
                 "invalid_display_response", "Larapaper display response had an invalid refresh rate"
             )
-        if not math.isfinite(float(refresh_rate)) or float(refresh_rate) <= 0:
+        try:
+            refresh_rate_value = float(refresh_rate)
+        except (OverflowError, ValueError):
+            raise LarapaperClientError(
+                "invalid_display_response", "Larapaper display response had an invalid refresh rate"
+            ) from None
+        if not math.isfinite(refresh_rate_value) or refresh_rate_value <= 0:
             raise LarapaperClientError(
                 "invalid_display_response", "Larapaper display response had an invalid refresh rate"
             )
@@ -143,7 +149,7 @@ class LarapaperClient:
         image_url = raw_image_url or None
         return DisplayResult(
             image_url=image_url,
-            effective_interval_seconds=max(float(refresh_rate), self._minimum_poll_seconds),
+        effective_interval_seconds=max(refresh_rate_value, self._minimum_poll_seconds),
         )
 
     @contextlib.asynccontextmanager
