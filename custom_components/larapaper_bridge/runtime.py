@@ -84,6 +84,7 @@ class EntryRuntime:
         self.client = client
         self.mac = config_entry.data[CONF_MAC]
         self.lifecycle_epoch = holder.lifecycle_epoch
+        self._cycle_generation = 0
         self.stopped = False
         self.tasks: set[asyncio.Task[Any]] = set()
         self.retry_handles: set[asyncio.TimerHandle] = set()
@@ -103,6 +104,32 @@ class EntryRuntime:
             and self.holder.current is self
             and self.holder.lifecycle_epoch == self.lifecycle_epoch
         )
+    def begin_cycle(self):
+        """Advance the cycle generation and return its fencing token."""
+        from .scheduler import OperationToken
+
+        self._cycle_generation += 1
+        return OperationToken(self.lifecycle_epoch, self._cycle_generation)
+
+    def is_token_current(self, token: Any) -> bool:
+        """Return whether a cycle token may still mutate runtime state."""
+        return (
+            self.is_current()
+            and token.lifecycle_epoch == self.lifecycle_epoch
+            and token.cycle_generation == self._cycle_generation
+        )
+
+    def create_task(self, awaitable: Awaitable[Any]) -> asyncio.Task[Any]:
+        """Create and register a runtime-owned task for unload cancellation."""
+        task = asyncio.create_task(awaitable)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
+
+    @property
+    def cycle_generation(self) -> int:
+        """Return the current display-cycle generation."""
+        return self._cycle_generation
 
     async def async_provision(self) -> dict[str, Any]:
         """Provision once; concurrent callers share the same operation."""

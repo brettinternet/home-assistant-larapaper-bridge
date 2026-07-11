@@ -1,0 +1,159 @@
+"""Display-cycle scheduling contracts and the first cycle implementation."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Literal, Protocol
+
+from .client import DisplayResult
+from .runtime import EntryRuntime
+
+ImageErrorCode = Literal["fetch", "validation", "conversion"]
+Status = Literal["ready", "starting", "stale", "error"]
+
+
+@dataclass(frozen=True, slots=True)
+class OperationToken:
+    """Identify one loaded-entry lifetime and one display cycle."""
+
+    lifecycle_epoch: int
+    cycle_generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class ImageOutcome:
+    """Immutable result returned by one image operation."""
+
+    png_bytes: bytes | None = None
+    resolved_url: str | None = None
+    error_code: ImageErrorCode | None = None
+
+    def __post_init__(self) -> None:
+        if self.png_bytes is not None and not isinstance(self.png_bytes, bytes):
+            raise TypeError("png_bytes must be immutable bytes")
+        has_image = self.png_bytes is not None
+        has_error = self.error_code is not None
+        if has_image == has_error:
+            raise ValueError("ImageOutcome must contain exactly one success or error")
+        if has_error and not self.resolved_url:
+            raise ValueError("failed image outcomes require a resolved URL")
+
+
+class ImageOperation(Protocol):
+    """Typed seam implemented by the bounded image pipeline."""
+
+    async def async_process(self, url: str, token: OperationToken) -> ImageOutcome:
+        """Fetch, validate, and convert one image."""
+
+    def abandon(self, token: OperationToken) -> None:
+        """Abandon work without waiting for a worker to finish."""
+
+
+@dataclass(frozen=True, slots=True)
+class CacheRecord:
+    """Immutable last-good image projection."""
+
+    png_bytes: bytes | None = None
+    received_monotonic: float | None = None
+    received_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.png_bytes is not None and not isinstance(self.png_bytes, bytes):
+            raise TypeError("png_bytes must be immutable bytes")
+        if self.png_bytes is None:
+            if self.received_monotonic is not None or self.received_at is not None:
+                raise ValueError("an empty cache cannot have receipt metadata")
+        elif self.received_monotonic is None or self.received_at is None:
+            raise ValueError("a cached image requires receipt metadata")
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticsState:
+    """Redacted immutable scheduler status projection."""
+
+    status: Status = "starting"
+    ready: bool = False
+    stale: bool = False
+    last_success_at: datetime | None = None
+    last_success_age_seconds: int | None = None
+    last_error: str | None = None
+    next_display_at: datetime | None = None
+    next_retry_at: datetime | None = None
+
+
+class DisplayClient(Protocol):
+    """Minimal display client required by the scheduler."""
+
+    async def async_display(self, mac: str, api_key: str) -> DisplayResult:
+        """Run one Larapaper display cycle."""
+
+
+Clock = Callable[[], float]
+Sleep = Callable[[float], Awaitable[None]]
+
+
+class DisplayScheduler:
+    """Run one display call per cycle using settlement-anchored deadlines."""
+
+    def __init__(
+        self,
+        runtime: EntryRuntime,
+        *,
+        api_key: str,
+        display_client: DisplayClient | None = None,
+        clock: Clock = time.monotonic,
+        sleep: Sleep = asyncio.sleep,
+    ) -> None:
+        self.runtime = runtime
+        self.api_key = api_key
+        self.display_client = display_client or runtime.client
+        self.clock = clock
+        self.sleep = sleep
+        self.next_display_deadline: float | None = None
+        self.last_display_result: DisplayResult | None = None
+        self._task: asyncio.Task[None] | None = None
+
+    async def async_run_cycle(self) -> DisplayResult | None:
+        """Run exactly one display request and settle its next deadline."""
+        token = self.runtime.begin_cycle()
+        result = await self.display_client.async_display(self.runtime.mac, self.api_key)
+        settled_at = self.clock()
+        if not self.runtime.is_token_current(token):
+            return None
+        self.last_display_result = result
+        self.next_display_deadline = settled_at + result.effective_interval_seconds
+        return result
+
+    def async_start(self) -> asyncio.Task[None]:
+        """Start the loop; its first display call is scheduled immediately."""
+        if self._task is not None and not self._task.done():
+            return self._task
+        self._task = self.runtime.create_task(self._run())
+        return self._task
+
+    async def _run(self) -> None:
+        while self.runtime.is_current():
+            result = await self.async_run_cycle()
+            if result is None or self.next_display_deadline is None:
+                return
+            await self.sleep(max(0.0, self.next_display_deadline - self.clock()))
+
+    def stop(self) -> None:
+        """Cancel the scheduler loop without waiting for display I/O."""
+        if self._task is not None:
+            self._task.cancel()
+
+
+__all__ = [
+    "CacheRecord",
+    "DiagnosticsState",
+    "DisplayScheduler",
+    "ImageErrorCode",
+    "ImageOperation",
+    "ImageOutcome",
+    "OperationToken",
+]
