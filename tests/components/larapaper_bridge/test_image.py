@@ -6,16 +6,21 @@ import asyncio
 import socket
 import random
 import struct
+import threading
 import zlib
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from custom_components.larapaper_bridge.image import (
     BMP_MAGIC,
     MAX_DECODED_DIMENSION,
     MAX_DECODED_PIXELS,
+    BoundedImageOperation,
     ImageConversionError,
     ImageDimensions,
     ImageNetworkPolicy,
+    ImageResources,
     ImageSSRFError,
     ImageTransportError,
     ImageURLResolutionError,
@@ -24,12 +29,15 @@ from custom_components.larapaper_bridge.image import (
     PolicyResolver,
     _REQUEST_ORIGIN,
     async_fetch_image,
+    async_get_image_resources,
     convert_image_to_png,
     create_image_connector,
     image_origin,
     resolve_image_url,
     validate_image_dimensions,
 )
+from custom_components.larapaper_bridge.scheduler import OperationToken
+
 
 
 BASE = "https://Larapaper.example/bridge///"
@@ -130,10 +138,14 @@ class FakeImageSession:
     def __init__(self, responses: list[FakeResponse]) -> None:
         self.responses = responses
         self.calls: list[tuple[str, dict[str, object]]] = []
+        self.closed = False
 
     def get(self, url: str, **kwargs: object) -> FakeResponse:
         self.calls.append((url, kwargs))
         return self.responses.pop(0)
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 @pytest.mark.parametrize(
@@ -720,3 +732,117 @@ async def test_transport_preserves_cancellation() -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await async_fetch_image(session, "https://images.example/start")
+
+
+@pytest.mark.asyncio
+async def test_image_resources_reuse_and_final_stop_cleanup() -> None:
+    class FakeBus:
+        def __init__(self) -> None:
+            self.listeners: list[tuple[str, object]] = []
+
+        def async_listen_once(self, event: str, callback: object) -> None:
+            self.listeners.append((event, callback))
+
+    class FakeHass:
+        def __init__(self) -> None:
+            self.data: dict[str, object] = {}
+            self.bus = FakeBus()
+
+    class FakeExecutor:
+        def __init__(self) -> None:
+            self.shutdown_calls: list[tuple[bool, bool]] = []
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    hass = FakeHass()
+    session = FakeImageSession([])
+    executor = FakeExecutor()
+    resources = await async_get_image_resources(
+        hass,
+        larapaper_base_url=BASE,
+        session=session,
+        executor=executor,  # type: ignore[arg-type]
+    )
+    assert (
+        await async_get_image_resources(
+            hass,
+            larapaper_base_url="https://other.example/",
+            session=FakeImageSession([]),
+            executor=FakeExecutor(),  # type: ignore[arg-type]
+        )
+    ) is resources
+    assert len(hass.bus.listeners) == 1
+
+    callback = hass.bus.listeners[0][1]
+    await callback(None)  # type: ignore[misc]
+    assert session.closed is True
+    assert executor.shutdown_calls == [(False, True)]
+
+
+@pytest.mark.asyncio
+async def test_image_operation_holds_admission_until_abandoned_worker_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from custom_components.larapaper_bridge import image as image_module
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_conversion(body: bytes, *, max_image_bytes: int) -> bytes:
+        del max_image_bytes
+        started.set()
+        assert release.wait(2)
+        return body
+
+    monkeypatch.setattr(
+        image_module, "convert_image_to_png", blocking_conversion
+    )
+    session = FakeImageSession(
+        [
+            FakeResponse(200, body=_png_bytes(1, 1)),
+            FakeResponse(200, body=_png_bytes(1, 1)),
+        ]
+    )
+    executor = ThreadPoolExecutor(max_workers=1)
+
+    class FakeBus:
+        def async_listen_once(self, _event: str, _callback: object) -> None:
+            return None
+
+    class FakeHass:
+        bus = FakeBus()
+
+    resources = ImageResources(FakeHass(), session=session, executor=executor)
+    operation = BoundedImageOperation(
+        resources, larapaper_base_url=BASE, max_image_bytes=100_000
+    )
+    first_token = OperationToken(0, 1)
+    first_task = asyncio.create_task(
+        operation.async_process("/first.png", first_token)
+    )
+    for _ in range(100):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.001)
+    assert started.is_set()
+
+    second = await operation.async_process(
+        "/second.png", OperationToken(0, 2)
+    )
+    assert second.error_code == "conversion"
+    assert len(session.calls) == 2
+
+    operation.abandon(first_token)
+    first_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_task
+    assert resources._conversion_future is not None
+
+    release.set()
+    for _ in range(100):
+        if resources._conversion_future is None:
+            break
+        await asyncio.sleep(0.001)
+    assert resources._conversion_future is None
+    await resources._async_stop(None)

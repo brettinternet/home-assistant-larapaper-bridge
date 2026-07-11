@@ -14,20 +14,26 @@ import struct
 import threading
 import warnings
 import zlib
-from collections.abc import AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
-from aiohttp import ClientTimeout, TCPConnector
+from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.client_exceptions import ClientConnectorError
 from aiohttp.resolver import DefaultResolver
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import HomeAssistant
 from PIL import Image, ImageFile
 from PIL import UnidentifiedImageError
 
-from .const import DEFAULT_MAX_IMAGE_BYTES
+from .const import DEFAULT_MAX_IMAGE_BYTES, DOMAIN
+
+if TYPE_CHECKING:
+    from .scheduler import ImageOutcome, OperationToken
 
 
 
@@ -327,17 +333,17 @@ def _validate_image_bytes(body: bytes, headers: Mapping[str, str]) -> None:
     is_bmp = body.startswith(BMP_MAGIC)
     if media_type is None or media_type == "application/octet-stream":
         if not (is_png or is_bmp):
-            raise ImageTransportError("image bytes did not match a supported format")
+            raise ImageValidationError("image bytes did not match a supported format")
         return
     if media_type == "image/png":
         if not is_png:
-            raise ImageTransportError("image bytes did not match PNG")
+            raise ImageValidationError("image bytes did not match PNG")
         return
     if media_type == "image/bmp":
         if not is_bmp:
-            raise ImageTransportError("image bytes did not match BMP")
+            raise ImageValidationError("image bytes did not match BMP")
         return
-    raise ImageTransportError("image content type was unsupported")
+    raise ImageValidationError("image content type was unsupported")
 
 
 def _checked_dimensions(
@@ -751,3 +757,234 @@ def create_image_connector(
         allowed_private_origins=policy.allowed_private_origins,
     )
     return PolicyConnector(policy_resolver)
+
+IMAGE_CONVERSION_TIMEOUT_SECONDS = 10.0
+
+
+class ImageResources:
+    """Own domain-scoped image transport and conversion resources."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        *,
+        session: Any,
+        executor: ThreadPoolExecutor,
+    ) -> None:
+        self.hass = hass
+        self.session = session
+        self.executor = executor
+        self._loop = asyncio.get_running_loop()
+        self._conversion_future: Future[bytes] | None = None
+        self._closed = False
+        hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STOP, self._async_stop
+        )
+
+    @classmethod
+    async def async_create(
+        cls,
+        hass: HomeAssistant,
+        policy: ImageNetworkPolicy,
+    ) -> ImageResources:
+        """Create the one domain-scoped session and executor."""
+        connector = create_image_connector(policy)
+        session = ClientSession(connector=connector, raise_for_status=False)
+        return cls(
+            hass,
+            session=session,
+            executor=ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="larapaper-image"
+            ),
+        )
+
+    @property
+    def closed(self) -> bool:
+        """Return whether final Home Assistant shutdown has started."""
+        return self._closed
+
+    def submit_conversion(
+        self,
+        function: Callable[..., bytes],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Future[bytes] | None:
+        """Submit one conversion without ever queueing a second payload."""
+        if self._closed or self._conversion_future is not None:
+            return None
+        try:
+            future = self.executor.submit(function, *args, **kwargs)
+        except RuntimeError:
+            return None
+        self._conversion_future = future
+        future.add_done_callback(self._conversion_done)
+        return future
+
+    def _conversion_done(self, future: Future[bytes]) -> None:
+        """Release admission only after the worker future really settles."""
+        self._loop.call_soon_threadsafe(self._release_conversion, future)
+
+    def _release_conversion(self, future: Future[bytes]) -> None:
+        """Release the active conversion slot on the HA event loop."""
+        if self._conversion_future is future:
+            self._conversion_future = None
+
+    async def _async_stop(self, _event: Any) -> None:
+        """Close the session and abandon, rather than wait for, workers."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            close_result = self.session.close()
+            if inspect.isawaitable(close_result):
+                await close_result
+        finally:
+            self.executor.shutdown(wait=False, cancel_futures=True)
+
+
+async def async_get_image_resources(
+    hass: HomeAssistant,
+    *,
+    larapaper_base_url: str,
+    image_base_url: str | None = None,
+    session: Any | None = None,
+    executor: ThreadPoolExecutor | None = None,
+) -> ImageResources:
+    """Return resources reused by every config-entry reload."""
+    from .runtime import RuntimeHolder
+
+    holder = RuntimeHolder.for_hass(hass)
+    resources = holder.image_resources
+    if resources is not None:
+        if resources.closed:
+            raise RuntimeError("image resources are closed")
+        return resources
+
+    if session is None or executor is None:
+        policy = ImageNetworkPolicy.from_urls(
+            larapaper_base_url, image_base_url
+        )
+        if session is None:
+            connector = create_image_connector(policy)
+            session = ClientSession(connector=connector, raise_for_status=False)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="larapaper-image"
+            )
+
+    resources = ImageResources(hass, session=session, executor=executor)
+    holder.image_resources = resources
+    return resources
+
+
+class BoundedImageOperation:
+    """Implement the scheduler's fetch, validation, and conversion seam."""
+
+    def __init__(
+        self,
+        resources: ImageResources,
+        *,
+        larapaper_base_url: str,
+        image_base_url: str | None = None,
+        max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
+    ) -> None:
+        self.resources = resources
+        self.larapaper_base_url = larapaper_base_url
+        self.image_base_url = image_base_url
+        self.max_image_bytes = max_image_bytes
+        self._abandoned_token: OperationToken | None = None
+
+    def abandon(self, token: OperationToken) -> None:
+        """Abandon logical work without releasing a running conversion slot."""
+        self._abandoned_token = token
+
+    def _is_abandoned(self, token: OperationToken) -> bool:
+        return self._abandoned_token == token
+
+    def _fallback_url(self, url: str) -> str:
+        try:
+            return resolve_image_url(
+                url,
+                larapaper_base_url=self.larapaper_base_url,
+                image_base_url=self.image_base_url,
+            )
+        except ImageURLResolutionError:
+            return url
+
+    async def async_process(
+        self, url: str, token: OperationToken
+    ) -> ImageOutcome:
+        """Fetch one image and convert it without blocking the HA loop."""
+        from .scheduler import ImageOutcome
+
+        resolved_url = self._fallback_url(url)
+        if self._is_abandoned(token):
+            raise asyncio.CancelledError
+        try:
+            response = await async_fetch_image(
+                self.resources.session,
+                url,
+                larapaper_base_url=self.larapaper_base_url,
+                image_base_url=self.image_base_url,
+                max_image_bytes=self.max_image_bytes,
+            )
+        except asyncio.CancelledError:
+            raise
+        except ImageValidationError:
+            return ImageOutcome(error_code="validation", resolved_url=resolved_url)
+        except ImageTransportError:
+            return ImageOutcome(error_code="fetch", resolved_url=resolved_url)
+        except Exception:
+            return ImageOutcome(error_code="fetch", resolved_url=resolved_url)
+
+        resolved_url = response.url
+        if self._is_abandoned(token):
+            raise asyncio.CancelledError
+        future = self.resources.submit_conversion(
+            convert_image_to_png,
+            response.body,
+            max_image_bytes=self.max_image_bytes,
+        )
+        if future is None:
+            return ImageOutcome(error_code="conversion", resolved_url=resolved_url)
+
+        try:
+            async with asyncio.timeout(IMAGE_CONVERSION_TIMEOUT_SECONDS):
+                converted = await asyncio.shield(asyncio.wrap_future(future))
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            return ImageOutcome(error_code="conversion", resolved_url=resolved_url)
+        except ImageValidationError:
+            return ImageOutcome(error_code="validation", resolved_url=resolved_url)
+        except ImageConversionError:
+            return ImageOutcome(error_code="conversion", resolved_url=resolved_url)
+        except Exception:
+            return ImageOutcome(error_code="conversion", resolved_url=resolved_url)
+
+        if self._is_abandoned(token):
+            raise asyncio.CancelledError
+        return ImageOutcome(
+            png_bytes=bytes(converted), resolved_url=resolved_url
+        )
+
+
+async def async_create_image_operation(
+    hass: HomeAssistant,
+    *,
+    larapaper_base_url: str,
+    image_base_url: str | None = None,
+    max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
+) -> BoundedImageOperation:
+    """Create an operation backed by the domain-scoped resources."""
+    resources = await async_get_image_resources(
+        hass,
+        larapaper_base_url=larapaper_base_url,
+        image_base_url=image_base_url,
+    )
+    return BoundedImageOperation(
+        resources,
+        larapaper_base_url=larapaper_base_url,
+        image_base_url=image_base_url,
+        max_image_bytes=max_image_bytes,
+    )

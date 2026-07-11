@@ -20,6 +20,7 @@ class RuntimeHolder:
     def __init__(self, hass: Any) -> None:
         self.hass = hass
         self.lifecycle_epoch = 0
+        self.image_resources: Any | None = None
         self.current: EntryRuntime | None = None
 
     @classmethod
