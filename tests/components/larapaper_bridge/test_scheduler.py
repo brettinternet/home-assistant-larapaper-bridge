@@ -2,7 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -54,13 +54,14 @@ class FakeDisplay:
         self.calls: list[tuple[str, str]] = []
         self.settle_delay = 0.0
         self.failure: LarapaperClientError | None = None
+        self.image_url: str | None = "/image.png"
 
     async def async_display(self, mac: str, api_key: str) -> DisplayResult:
         self.calls.append((mac, api_key))
         self.clock.value += self.settle_delay
         if self.failure is not None:
             raise self.failure
-        return DisplayResult("/image.png", 60.0)
+        return DisplayResult(self.image_url, 60.0)
  
 class FakeImage:
     def __init__(self, clock: FakeClock, payload: bytes = b"png") -> None:
@@ -126,6 +127,60 @@ async def test_image_success_replaces_cache_and_freshness_uses_monotonic_boundar
     assert scheduler.cached_image(109.999) == b"png"
     assert scheduler.is_cache_fresh(110.0) is False
     assert scheduler.cached_image(110.0) is None
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_projection_uses_precedence_and_monotonic_age(runtime):
+    clock = FakeClock()
+    display = FakeDisplay(clock)
+    received_at = datetime(2026, 7, 11, tzinfo=timezone.utc)
+    scheduler = DisplayScheduler(
+        runtime,
+        api_key="secret",
+        display_client=display,
+        image_operation=FakeImage(clock),
+        clock=clock,
+        utc_now=lambda: received_at,
+    )
+
+    await scheduler.async_run_cycle()
+    scheduler.last_error = "display_failed"
+
+    ready = scheduler.diagnostics_state(now=109.5)
+    assert ready == DiagnosticsState(
+        status="ready",
+        ready=True,
+        stale=False,
+        last_success_at=received_at,
+        last_success_age_seconds=9,
+        last_error="display_failed",
+        next_display_at=received_at + timedelta(seconds=50.5),
+        next_retry_at=None,
+    )
+
+    stale = scheduler.diagnostics_state(now=110.0)
+    assert stale.status == "stale"
+    assert stale.ready is False
+    assert stale.stale is True
+    assert stale.last_success_age_seconds == 10
+    assert stale.last_error == "display_failed"
+
+
+@pytest.mark.asyncio
+async def test_missing_image_url_records_safe_error_without_image_work(runtime):
+    clock = FakeClock()
+    display = FakeDisplay(clock)
+    display.image_url = None
+    image = FakeImage(clock)
+    scheduler = DisplayScheduler(
+        runtime, api_key="secret", display_client=display, image_operation=image, clock=clock
+    )
+
+    await scheduler.async_run_cycle()
+
+    assert image.calls == []
+    assert scheduler.diagnostics_state().status == "error"
+    assert scheduler.diagnostics_state().last_error == "image_url_missing"
 
 
 @pytest.mark.asyncio

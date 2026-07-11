@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal, Protocol
 
 from .client import DisplayResult, LarapaperClientError
@@ -157,14 +157,20 @@ class DisplayScheduler:
         self._last_effective_interval = result.effective_interval_seconds
         self.next_display_deadline = settled_at + self._last_effective_interval
 
-        if result.image_url is not None and self.image_operation is not None:
+        if result.image_url is None:
+            if self.runtime.is_token_current(token):
+                self.last_error = "image_url_missing"
+        elif self.image_operation is not None:
             outcome = await self.image_operation.async_process(result.image_url, token)
-            if self.runtime.is_token_current(token) and outcome.png_bytes is not None:
-                self.cache_record = CacheRecord(
-                    png_bytes=outcome.png_bytes,
-                    received_monotonic=self.clock(),
-                    received_at=self.utc_now(),
-                )
+            if self.runtime.is_token_current(token):
+                if outcome.png_bytes is not None:
+                    self.cache_record = CacheRecord(
+                        png_bytes=outcome.png_bytes,
+                        received_monotonic=self.clock(),
+                        received_at=self.utc_now(),
+                    )
+                elif outcome.error_code is not None:
+                    self.last_error = f"image_{outcome.error_code}_failed"
         return result
 
     def is_cache_fresh(self, now: float | None = None) -> bool:
@@ -180,6 +186,43 @@ class DisplayScheduler:
         if not self.is_cache_fresh(now):
             return None
         return self.cache_record.png_bytes
+
+    def diagnostics_state(self, now: float | None = None) -> DiagnosticsState:
+        """Return a redacted, monotonic-clock-backed status projection."""
+        current = self.clock() if now is None else now
+        now_utc = self.utc_now()
+        record = self.cache_record
+        has_cache = record.png_bytes is not None and record.received_monotonic is not None
+        age = (
+            max(0.0, current - record.received_monotonic)
+            if has_cache and record.received_monotonic is not None
+            else None
+        )
+        fresh = age is not None and age < self.max_stale_seconds
+        stale = has_cache and not fresh
+        if fresh:
+            status: Status = "ready"
+        elif stale:
+            status = "stale"
+        elif self.last_error is not None:
+            status = "error"
+        else:
+            status = "starting"
+        next_display_at = (
+            now_utc + timedelta(seconds=self.next_display_deadline - current)
+            if self.next_display_deadline is not None
+            else None
+        )
+        return DiagnosticsState(
+            status=status,
+            ready=fresh,
+            stale=stale,
+            last_success_at=record.received_at if has_cache else None,
+            last_success_age_seconds=int(age) if age is not None else None,
+            last_error=self.last_error,
+            next_display_at=next_display_at,
+            next_retry_at=None,
+        )
 
     def async_start(self) -> asyncio.Task[None]:
         """Start the loop; its first display call is scheduled immediately."""
