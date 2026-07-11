@@ -299,3 +299,33 @@ async def test_setup_failure_exposes_safe_error_projection(hass, monkeypatch, se
     await asyncio.sleep(0)
 
     assert FakeScheduler.instances[-1].last_error == "setup_failed"
+
+@pytest.mark.asyncio
+async def test_image_resource_failure_does_not_start_display_scheduler(
+    hass, monkeypatch, setup_fakes
+):
+    entry = FakeEntry("entry-1", ENTRY_DATA)
+
+    async def forward_entry_setups(_entry, _platforms):
+        return None
+
+    async def create_image_operation(_hass, **_kwargs):
+        raise RuntimeError("image resources unavailable")
+
+    monkeypatch.setattr(
+        hass.config_entries,
+        "async_forward_entry_setups",
+        forward_entry_setups,
+    )
+    monkeypatch.setattr(
+        integration,
+        "async_create_image_operation",
+        create_image_operation,
+    )
+
+    assert await integration.async_setup_entry(hass, entry) is True
+    await asyncio.sleep(0)
+
+    scheduler = FakeScheduler.instances[-1]
+    assert scheduler.last_error == "setup_failed"
+    assert scheduler.started is False
