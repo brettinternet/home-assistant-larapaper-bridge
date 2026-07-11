@@ -102,6 +102,26 @@ class BlockingImage:
 
     def abandon(self, token: OperationToken) -> None:
         self.abandoned.append(token)
+class RetryBlockingImage:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls: list[tuple[str, OperationToken]] = []
+        self.abandoned: list[OperationToken] = []
+        self.attempt = 0
+
+    async def async_process(self, url: str, token: OperationToken) -> ImageOutcome:
+        self.attempt += 1
+        self.calls.append((url, token))
+        if self.attempt == 1:
+            return ImageOutcome(error_code="fetch", resolved_url=url)
+        self.started.set()
+        await self.release.wait()
+        return ImageOutcome(png_bytes=b"late", resolved_url=url)
+
+    def abandon(self, token: OperationToken) -> None:
+        self.abandoned.append(token)
+
 
 
 
@@ -260,6 +280,41 @@ async def test_unload_abandons_blocked_image_and_rejects_late_publication(runtim
     image.release.set()
     assert await cycle == DisplayResult("/image.png", 60.0)
     assert scheduler.cache_record == CacheRecord()
+
+
+@pytest.mark.asyncio
+async def test_next_cycle_abandons_blocked_retry_before_new_display(runtime):
+    clock = FakeClock()
+    display = FakeDisplay(clock)
+    image = RetryBlockingImage()
+    retry_gate = asyncio.Event()
+
+    async def sleep(delay: float) -> None:
+        await retry_gate.wait()
+
+    scheduler = DisplayScheduler(
+        runtime,
+        api_key="secret",
+        display_client=display,
+        image_operation=image,
+        clock=clock,
+        sleep=sleep,
+    )
+
+    await scheduler.async_run_cycle()
+    await asyncio.sleep(0)
+    clock.value = 105.0
+    retry_gate.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    await image.started.wait()
+
+    scheduler.next_display_deadline = 110.0
+    clock.value = 110.0
+    await scheduler.async_run_cycle(wait_for_image=False)
+
+    assert display.calls == [(MAC, "secret"), (MAC, "secret")]
+    assert image.abandoned == [OperationToken(0, 1)]
 
 
 @pytest.mark.asyncio

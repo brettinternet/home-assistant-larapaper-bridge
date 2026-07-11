@@ -292,9 +292,16 @@ class DisplayScheduler:
             self.next_retry_deadline = None
             self._retry_task = None
             self._image_token = token
+            self._image_task = asyncio.current_task()
             await self._process_image(url, token)
         finally:
-            if self._retry_token == token and self._retry_task is asyncio.current_task():
+            current_task = asyncio.current_task()
+            if self._image_task is current_task:
+                self._image_task = None
+                self._image_token = None
+            if self._retry_token == token and (
+                self._retry_task is current_task or self._retry_task is None
+            ):
                 self._retry_token = None
                 self._retry_url = None
                 self._retry_task = None
