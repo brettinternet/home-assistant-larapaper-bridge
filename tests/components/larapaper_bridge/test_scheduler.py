@@ -21,6 +21,7 @@ ENTRY_DATA = {
     "base_url": "https://example.test/",
     "mac": MAC,
     "min_poll_seconds": 60.0,
+    "max_stale_seconds": 10,
 }
 
 
@@ -60,6 +61,19 @@ class FakeDisplay:
         if self.failure is not None:
             raise self.failure
         return DisplayResult("/image.png", 60.0)
+ 
+class FakeImage:
+    def __init__(self, clock: FakeClock, payload: bytes = b"png") -> None:
+        self.clock = clock
+        self.payload = payload
+        self.calls: list[tuple[str, OperationToken]] = []
+
+    async def async_process(self, url: str, token: OperationToken) -> ImageOutcome:
+        self.calls.append((url, token))
+        return ImageOutcome(png_bytes=self.payload, resolved_url=url)
+
+    def abandon(self, token: OperationToken) -> None:
+        raise AssertionError("abandonment is not part of cache tests")
 
 
 @pytest.fixture
@@ -84,6 +98,61 @@ async def test_one_cycle_calls_display_once_and_anchors_deadline_at_settlement(r
     assert display.calls == [(MAC, "secret")]
     assert runtime.cycle_generation == 1
     assert scheduler.next_display_deadline == 167.0
+
+
+@pytest.mark.asyncio
+async def test_image_success_replaces_cache_and_freshness_uses_monotonic_boundary(runtime):
+    clock = FakeClock()
+    display = FakeDisplay(clock)
+    image = FakeImage(clock)
+    received_at = datetime(2026, 7, 11, tzinfo=timezone.utc)
+    scheduler = DisplayScheduler(
+        runtime,
+        api_key="secret",
+        display_client=display,
+        image_operation=image,
+        clock=clock,
+        utc_now=lambda: received_at,
+    )
+
+    await scheduler.async_run_cycle()
+
+    assert image.calls == [("/image.png", OperationToken(0, 1))]
+    assert scheduler.cache_record == CacheRecord(
+        png_bytes=b"png",
+        received_monotonic=100.0,
+        received_at=received_at,
+    )
+    assert scheduler.cached_image(109.999) == b"png"
+    assert scheduler.is_cache_fresh(110.0) is False
+    assert scheduler.cached_image(110.0) is None
+
+
+@pytest.mark.asyncio
+async def test_late_image_success_after_unload_cannot_publish_cache(runtime):
+    clock = FakeClock()
+    display = FakeDisplay(clock)
+
+    class InvalidatingImage(FakeImage):
+        async def async_process(self, url: str, token: OperationToken) -> ImageOutcome:
+            self.runtime.holder.invalidate()
+            return await super().async_process(url, token)
+
+        def __init__(self, runtime):
+            super().__init__(clock)
+            self.runtime = runtime
+
+    scheduler = DisplayScheduler(
+        runtime,
+        api_key="secret",
+        display_client=display,
+        image_operation=InvalidatingImage(runtime),
+        clock=clock,
+    )
+
+    await scheduler.async_run_cycle()
+
+    assert scheduler.cache_record == CacheRecord()
 
 
 @pytest.mark.asyncio

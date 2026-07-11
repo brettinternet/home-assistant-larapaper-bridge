@@ -6,15 +6,18 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal, Protocol
 
 from .client import DisplayResult, LarapaperClientError
-from .const import CONF_MIN_POLL_SECONDS
+from .const import CONF_MAX_STALE_SECONDS, CONF_MIN_POLL_SECONDS
 from .runtime import EntryRuntime
 
 ImageErrorCode = Literal["fetch", "validation", "conversion"]
 Status = Literal["ready", "starting", "stale", "error"]
+
+UTCNow = Callable[[], datetime]
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,17 +109,25 @@ class DisplayScheduler:
         *,
         api_key: str,
         display_client: DisplayClient | None = None,
+        image_operation: ImageOperation | None = None,
         clock: Clock = time.monotonic,
         sleep: Sleep = asyncio.sleep,
+        utc_now: UTCNow = lambda: datetime.now(timezone.utc),
     ) -> None:
         self.runtime = runtime
         self.api_key = api_key
         self.display_client = display_client or runtime.client
+        self.image_operation = image_operation
         self.clock = clock
         self.sleep = sleep
+        self.utc_now = utc_now
+        self.max_stale_seconds = int(
+            runtime.config_entry.data.get(CONF_MAX_STALE_SECONDS, 3600)
+        )
         self.next_display_deadline: float | None = None
         self.last_display_result: DisplayResult | None = None
         self.last_error: str | None = None
+        self.cache_record = CacheRecord()
         self._last_effective_interval = float(
             runtime.config_entry.data[CONF_MIN_POLL_SECONDS]
         )
@@ -145,7 +156,30 @@ class DisplayScheduler:
         self.last_display_result = result
         self._last_effective_interval = result.effective_interval_seconds
         self.next_display_deadline = settled_at + self._last_effective_interval
+
+        if result.image_url is not None and self.image_operation is not None:
+            outcome = await self.image_operation.async_process(result.image_url, token)
+            if self.runtime.is_token_current(token) and outcome.png_bytes is not None:
+                self.cache_record = CacheRecord(
+                    png_bytes=outcome.png_bytes,
+                    received_monotonic=self.clock(),
+                    received_at=self.utc_now(),
+                )
         return result
+
+    def is_cache_fresh(self, now: float | None = None) -> bool:
+        """Return whether the last-good image is strictly inside its stale limit."""
+        record = self.cache_record
+        if record.png_bytes is None or record.received_monotonic is None:
+            return False
+        current = self.clock() if now is None else now
+        return current - record.received_monotonic < self.max_stale_seconds
+
+    def cached_image(self, now: float | None = None) -> bytes | None:
+        """Return cached PNG bytes only while the cache is fresh."""
+        if not self.is_cache_fresh(now):
+            return None
+        return self.cache_record.png_bytes
 
     def async_start(self) -> asyncio.Task[None]:
         """Start the loop; its first display call is scheduled immediately."""
