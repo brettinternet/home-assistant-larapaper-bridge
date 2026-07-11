@@ -75,6 +75,14 @@ class FakeImage:
 
     def abandon(self, token: OperationToken) -> None:
         raise AssertionError("abandonment is not part of cache tests")
+class FakeCameraEntity:
+    def __init__(self) -> None:
+        self.state_writes = 0
+
+    def async_write_ha_state(self) -> None:
+        self.state_writes += 1
+
+
 class SequenceImage:
     def __init__(self, outcomes: list[ImageOutcome]) -> None:
         self.outcomes = outcomes
@@ -177,6 +185,26 @@ async def test_image_success_replaces_cache_and_freshness_uses_monotonic_boundar
     assert scheduler.cached_image(109.999) == b"png"
     assert scheduler.is_cache_fresh(110.0) is False
     assert scheduler.cached_image(110.0) is None
+
+@pytest.mark.asyncio
+async def test_cache_publication_and_stale_boundary_notify_camera(runtime):
+    clock = FakeClock()
+    camera = FakeCameraEntity()
+    runtime.camera_entity = camera
+    scheduler = DisplayScheduler(
+        runtime,
+        api_key="secret",
+        display_client=FakeDisplay(clock),
+        image_operation=FakeImage(clock),
+        clock=clock,
+    )
+
+    await scheduler.async_run_cycle()
+    assert camera.state_writes == 1
+
+    clock.value = 110.0
+    scheduler._notify_stale_cache(100.0)
+    assert camera.state_writes == 2
 
 
 @pytest.mark.asyncio

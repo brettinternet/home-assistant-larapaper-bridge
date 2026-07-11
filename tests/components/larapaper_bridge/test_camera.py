@@ -129,3 +129,4 @@ async def test_camera_entity_setup_uses_existing_entry_runtime(hass, camera_runt
 
     assert len(added) == 1
     assert isinstance(added[0], LarapaperBridgeCamera)
+    assert runtime.camera_entity is added[0]

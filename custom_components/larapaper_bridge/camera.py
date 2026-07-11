@@ -60,7 +60,9 @@ async def async_setup_entry(
     runtime = holder.current
     if runtime.config_entry is not entry:
         return
-    async_add_entities([LarapaperBridgeCamera(runtime)])
+    camera = LarapaperBridgeCamera(runtime)
+    runtime.camera_entity = camera
+    async_add_entities([camera])
 
 
 __all__ = ["LarapaperBridgeCamera", "async_setup_entry"]

@@ -71,15 +71,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload platforms before fencing the entry runtime."""
+    """Fence the entry before unloading its platforms."""
     holder = hass.data.get(DOMAIN)
-    try:
-        return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    finally:
-        if isinstance(holder, RuntimeHolder):
-            runtime = holder.current
-            if runtime is not None and runtime.config_entry is entry:
-                holder.invalidate()
-
+    if isinstance(holder, RuntimeHolder):
+        runtime = holder.current
+        if runtime is not None and runtime.config_entry is entry:
+            holder.invalidate()
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 __all__ = ["PLATFORMS", "async_setup_entry", "async_unload_entry"]

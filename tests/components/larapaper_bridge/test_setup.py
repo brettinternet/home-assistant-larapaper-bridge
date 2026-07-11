@@ -169,6 +169,7 @@ async def test_unload_forwards_platform_unload_and_invalidates_runtime(
         return None
 
     async def unload_platforms(unloaded_entry, platforms):
+        assert runtime.invalidated is True
         unloaded.append((unloaded_entry, platforms))
         return True
     async def create_image_operation(_hass, **_kwargs):

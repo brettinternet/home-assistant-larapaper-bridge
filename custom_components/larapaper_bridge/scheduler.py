@@ -165,6 +165,7 @@ class DisplayScheduler:
         self._retry_token: OperationToken | None = None
         self._retry_url: str | None = None
         self._retry_attempt = 0
+        self._stale_task: asyncio.Task[None] | None = None
         runtime.scheduler = self
 
     async def async_run_cycle(
@@ -244,13 +245,16 @@ class DisplayScheduler:
         self._image_task = None
         self._image_token = None
         if outcome.png_bytes is not None:
+            received_monotonic = self.clock()
             self.cache_record = CacheRecord(
                 png_bytes=outcome.png_bytes,
-                received_monotonic=self.clock(),
+                received_monotonic=received_monotonic,
                 received_at=self.utc_now(),
             )
             self.last_error = None
             self._clear_retry()
+            self._schedule_stale_notification(received_monotonic)
+            self._notify_camera_state()
             return
         if outcome.error_code is not None:
             self.last_error = _IMAGE_ERROR_CODES.get(
@@ -315,6 +319,47 @@ class DisplayScheduler:
         self._retry_url = None
         self._retry_attempt = 0
         self.next_retry_deadline = None
+
+    def _notify_camera_state(self) -> None:
+        """Refresh the cache-backed camera projection on the HA loop."""
+        self.runtime.notify_camera_state()
+
+    def _schedule_stale_notification(self, received_monotonic: float) -> None:
+        """Notify the camera when this cache record reaches its stale boundary."""
+        if self._stale_task is not None:
+            self._stale_task.cancel()
+        delay = max(
+            0.0,
+            received_monotonic + self.max_stale_seconds - self.clock(),
+        )
+        self._stale_task = self.runtime.create_task(
+            self._wait_for_stale_boundary(received_monotonic, delay)
+        )
+
+    async def _wait_for_stale_boundary(
+        self, received_monotonic: float, delay: float
+    ) -> None:
+        """Wait on the scheduler's injected clock/sleep boundary."""
+        try:
+            await self.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._stale_task is asyncio.current_task():
+                self._stale_task = None
+        self._notify_stale_cache(received_monotonic)
+
+    def _notify_stale_cache(self, received_monotonic: float) -> None:
+        """Refresh the camera only if the same cache record is now stale."""
+        if not self.runtime.is_current():
+            return
+        record = self.cache_record
+        if record.received_monotonic != received_monotonic:
+            return
+        if self.is_cache_fresh():
+            self._schedule_stale_notification(received_monotonic)
+            return
+        self._notify_camera_state()
 
     def is_cache_fresh(self, now: float | None = None) -> bool:
         """Return whether the last-good image is strictly inside its stale limit."""
@@ -389,6 +434,9 @@ class DisplayScheduler:
     def stop(self) -> None:
         """Cancel the scheduler loop and abandon image work without waiting."""
         self._abandon_current_work()
+        if self._stale_task is not None:
+            self._stale_task.cancel()
+            self._stale_task = None
         if self._task is not None:
             self._task.cancel()
 
