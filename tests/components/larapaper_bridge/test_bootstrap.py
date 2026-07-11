@@ -14,6 +14,15 @@ ROOT = Path(__file__).parents[3]
 INTEGRATION = ROOT / "custom_components" / "larapaper_bridge"
 
 
+def test_repository_contains_one_integration() -> None:
+    integration_dirs = sorted(
+        path.name
+        for path in (ROOT / "custom_components").iterdir()
+        if path.is_dir() and not path.name.startswith("__")
+    )
+    assert integration_dirs == ["larapaper_bridge"]
+
+
 def test_manifest_and_translation_resources() -> None:
     manifest = json.loads((INTEGRATION / "manifest.json").read_text())
     assert manifest == {
