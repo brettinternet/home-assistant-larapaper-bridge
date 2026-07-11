@@ -314,6 +314,23 @@ async def test_store_pending_write_failure_never_retries(hass):
 
 
 @pytest.mark.asyncio
+async def test_store_complete_write_failure_never_retries(hass):
+    class CompleteWriteErrorStore(FakeStore):
+        async def async_save_complete(self, mac, api_key, friendly_id):
+            raise OSError("store unavailable")
+
+    client = FakeClient([SetupCredentials("api-key", "friendly-id")])
+    runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
+        FakeEntry(ENTRY_DATA), store=CompleteWriteErrorStore(), client=client
+    )
+
+    with pytest.raises(OSError, match="store unavailable"):
+        await runtime.async_provision()
+
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_late_setup_completion_cannot_persist_after_unload(hass):
     started = asyncio.Event()
     release = asyncio.Event()
