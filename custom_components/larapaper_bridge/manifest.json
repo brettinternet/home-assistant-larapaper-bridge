@@ -1,7 +1,7 @@
 {
   "domain": "larapaper_bridge",
   "name": "Larapaper Bridge",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "documentation": "https://github.com/brettinternet/home-assistant-larapaper-bridge",
   "issue_tracker": "https://github.com/brettinternet/home-assistant-larapaper-bridge/issues",
   "codeowners": ["@brettinternet"],
