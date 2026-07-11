@@ -57,6 +57,36 @@ def test_hacs_metadata_and_brand_provenance() -> None:
     assert provenance["sha256"] == hashlib.sha256(icon_path.read_bytes()).hexdigest()
 
 
+def test_release_documentation_and_workflows() -> None:
+    readme = (ROOT / "README.md").read_text()
+    for required_text in (
+        "2026.7.0",
+        "Custom repositories",
+        "Minimum poll seconds",
+        "manual",
+        "cache-only",
+        "setup_auto_assign_disabled",
+        "Privacy and network behavior",
+        "Upgrades and uninstall",
+        "https://github.com/brettinternet/home-assistant-larapaper-bridge/issues",
+    ):
+        assert required_text in readme
+
+    test_workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text()
+    assert 'python-version: "3.14"' in test_workflow
+    assert '"2026.7.0"' in test_workflow
+    assert '"2026.7.2"' in test_workflow
+    assert "test_bootstrap.py" in test_workflow
+    assert "python -m pytest -q" in test_workflow
+
+    validation_workflow = (
+        ROOT / ".github" / "workflows" / "validate.yml"
+    ).read_text()
+    assert "home-assistant/actions/hassfest@master" in validation_workflow
+    assert "hacs/action@main" in validation_workflow
+    assert "category: integration" in validation_workflow
+
+
 def test_declared_python_modules_import() -> None:
     for path in INTEGRATION.glob("*.py"):
         importlib.import_module(f"custom_components.larapaper_bridge.{path.stem}")

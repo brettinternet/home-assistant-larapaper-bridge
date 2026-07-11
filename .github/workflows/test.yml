@@ -1,0 +1,42 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest (Home Assistant ${{ matrix.home-assistant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        home-assistant:
+          - "2026.7.0"
+          - "2026.7.2"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            "homeassistant==${{ matrix.home-assistant }}" \
+            pytest-homeassistant-custom-component \
+            pytest-asyncio \
+            PyTurboJPEG
+      - name: Run focused integration tests
+        run: >-
+          python -m pytest -q
+          tests/components/larapaper_bridge/test_bootstrap.py
+          tests/components/larapaper_bridge/test_camera.py
+          tests/components/larapaper_bridge/test_diagnostics.py
+      - name: Run complete integration suite
+        run: python -m pytest -q
