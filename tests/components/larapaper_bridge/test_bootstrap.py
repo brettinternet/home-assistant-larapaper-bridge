@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import json
 from pathlib import Path
 
@@ -31,9 +31,4 @@ def test_manifest_and_translation_resources() -> None:
 
 def test_declared_python_modules_import() -> None:
     for path in INTEGRATION.glob("*.py"):
-        spec = importlib.util.spec_from_file_location(
-            f"larapaper_bridge_{path.stem}", path
-        )
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        importlib.import_module(f"custom_components.larapaper_bridge.{path.stem}")
