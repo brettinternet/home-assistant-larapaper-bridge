@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import socket
+
 import pytest
 
 from custom_components.larapaper_bridge.image import (
     ImageNetworkPolicy,
     ImageSSRFError,
+    ImageTransportError,
     ImageURLResolutionError,
     PolicyResolver,
     _REQUEST_ORIGIN,
+    async_fetch_image,
     create_image_connector,
     image_origin,
     resolve_image_url,
@@ -18,6 +22,42 @@ from custom_components.larapaper_bridge.image import (
 
 
 BASE = "https://Larapaper.example/bridge///"
+
+
+class FakeResponse:
+    def __init__(
+        self,
+        status: int,
+        *,
+        headers: dict[str, str] | None = None,
+        body: bytes = b"image",
+        read_error: BaseException | None = None,
+    ) -> None:
+        self.status = status
+        self.headers = headers or {}
+        self._body = body
+        self._read_error = read_error
+
+    async def __aenter__(self) -> FakeResponse:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def read(self) -> bytes:
+        if self._read_error is not None:
+            raise self._read_error
+        return self._body
+
+
+class FakeImageSession:
+    def __init__(self, responses: list[FakeResponse]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def get(self, url: str, **kwargs: object) -> FakeResponse:
+        self.calls.append((url, kwargs))
+        return self.responses.pop(0)
 
 
 @pytest.mark.parametrize(
@@ -250,3 +290,114 @@ async def test_connector_rejects_literal_ip_for_wrong_request_scheme() -> None:
     finally:
         _REQUEST_ORIGIN.reset(token)
         await connector.close()
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+@pytest.mark.asyncio
+async def test_transport_follows_supported_redirects_without_forwarding_headers(
+    status: int,
+) -> None:
+    session = FakeImageSession(
+        [
+            FakeResponse(status, headers={"Location": "/next"}),
+            FakeResponse(200, headers={"Content-Type": "image/png"}, body=b"png"),
+        ]
+    )
+
+    result = await async_fetch_image(session, "https://images.example/start")
+
+    assert result.url == "https://images.example/next"
+    assert result.body == b"png"
+    assert [call[0] for call in session.calls] == [
+        "https://images.example/start",
+        "https://images.example/next",
+    ]
+    assert all(call[1]["allow_redirects"] is False for call in session.calls)
+    assert all(call[1]["headers"] == {} for call in session.calls)
+
+
+@pytest.mark.asyncio
+async def test_transport_resolves_relative_redirects_and_allows_three_hops() -> None:
+    session = FakeImageSession(
+        [
+            FakeResponse(301, headers={"Location": "../two"}),
+            FakeResponse(302, headers={"Location": "//cdn.example/three"}),
+            FakeResponse(307, headers={"Location": "four?filename=screen.bmp"}),
+            FakeResponse(200, body=b"done"),
+        ]
+    )
+
+    result = await async_fetch_image(session, "https://images.example/path/one")
+
+    assert result.url == "https://cdn.example/four?filename=screen.bmp"
+    assert len(session.calls) == 4
+
+
+@pytest.mark.parametrize(
+    "location",
+    [None, "", "ftp://cdn.example/image", "https://user:secret@cdn.example/image", "/image#part"],
+)
+@pytest.mark.asyncio
+async def test_transport_rejects_invalid_redirect_locations(location: str | None) -> None:
+    session = FakeImageSession([FakeResponse(302, headers={} if location is None else {"Location": location})])
+
+    with pytest.raises(ImageTransportError):
+        await async_fetch_image(session, "https://images.example/start")
+
+    assert len(session.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_transport_rejects_https_downgrade_and_unrecognized_redirects() -> None:
+    downgrade = FakeImageSession(
+        [FakeResponse(302, headers={"Location": "http://images.example/next"})]
+    )
+    with pytest.raises(ImageTransportError):
+        await async_fetch_image(downgrade, "https://images.example/start")
+
+    terminal = FakeImageSession(
+        [FakeResponse(300, headers={"Location": "/should-not-follow"})]
+    )
+    with pytest.raises(ImageTransportError):
+        await async_fetch_image(terminal, "https://images.example/start")
+
+    assert len(terminal.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_transport_rejects_fourth_redirect() -> None:
+    session = FakeImageSession(
+        [
+            FakeResponse(301, headers={"Location": "/one"}),
+            FakeResponse(302, headers={"Location": "/two"}),
+            FakeResponse(303, headers={"Location": "/three"}),
+            FakeResponse(308, headers={"Location": "/four"}),
+        ]
+    )
+
+    with pytest.raises(ImageTransportError, match="limit"):
+        await async_fetch_image(session, "https://images.example/start")
+
+    assert len(session.calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_transport_uses_one_timeout_for_body_and_redirect_chain() -> None:
+    async def slow_body() -> bytes:
+        await asyncio.sleep(0.05)
+        return b"late"
+
+    response = FakeResponse(200)
+    response.read = slow_body  # type: ignore[method-assign]
+    session = FakeImageSession([response])
+
+    with pytest.raises(ImageTransportError):
+        await async_fetch_image(session, "https://images.example/start", timeout_seconds=0.001)
+
+
+@pytest.mark.asyncio
+async def test_transport_preserves_cancellation() -> None:
+    session = FakeImageSession([FakeResponse(200, read_error=asyncio.CancelledError())])
+
+    with pytest.raises(asyncio.CancelledError):
+        await async_fetch_image(session, "https://images.example/start")

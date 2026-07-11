@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import inspect
+import math
 import ipaddress
 import socket
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import SplitResult, urlsplit, urlunsplit
+from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
-from aiohttp import TCPConnector
+from aiohttp import ClientTimeout, TCPConnector
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.client_exceptions import ClientConnectorError
 from aiohttp.resolver import DefaultResolver
@@ -24,6 +28,25 @@ class ImageURLResolutionError(ValueError):
 
 class ImageSSRFError(OSError):
     """Raised when DNS results do not satisfy the image-origin policy."""
+
+
+class ImageTransportError(OSError):
+    """Raised when an image request cannot complete safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class ImageResponse:
+    """The final response returned by the image transport."""
+
+    url: str
+    status: int
+    headers: Mapping[str, str]
+    body: bytes
+
+
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+IMAGE_REQUEST_TIMEOUT_SECONDS = 10.0
+MAX_IMAGE_REDIRECTS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +161,113 @@ def resolve_image_url(
             )
         )
     return resolved
+
+
+def _redirect_target(current_url: str, location: object) -> str:
+    """Resolve and validate one redirect destination."""
+    if not isinstance(location, str) or not location:
+        raise ImageTransportError("image redirect had no valid location")
+    target = urljoin(current_url, location)
+    try:
+        parsed = _parse_http_url(target)
+        current_scheme = urlsplit(current_url).scheme.lower()
+        if current_scheme == "https" and parsed.scheme.lower() != "https":
+            raise ImageTransportError("image redirect downgraded HTTPS")
+        return _normalized_absolute_url(parsed)
+    except ImageTransportError:
+        raise
+    except ImageURLResolutionError:
+        raise ImageTransportError("image redirect had an invalid location") from None
+
+
+@contextlib.asynccontextmanager
+async def _image_request(
+    session: Any,
+    url: str,
+    *,
+    timeout: ClientTimeout,
+) -> AsyncIterator[Any]:
+    """Support aiohttp requests and deterministic async test fakes."""
+    request = session.get(
+        url,
+        headers={},
+        allow_redirects=False,
+        timeout=timeout,
+    )
+    if hasattr(request, "__aenter__"):
+        async with request as response:
+            yield response
+        return
+    if inspect.isawaitable(request):
+        request = await request
+    yield request
+
+
+async def async_fetch_image(
+    session: Any,
+    image_url: str,
+    *,
+    larapaper_base_url: str | None = None,
+    image_base_url: str | None = None,
+    timeout_seconds: float = IMAGE_REQUEST_TIMEOUT_SECONDS,
+    max_redirects: int = MAX_IMAGE_REDIRECTS,
+) -> ImageResponse:
+    """Fetch one image response with bounded, policy-aware redirects.
+
+    The session must use ``create_image_connector`` so DNS policy is enforced
+    for the initial URL and every redirect destination.
+    """
+    if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool):
+        raise ValueError("timeout_seconds must be positive")
+    if not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    if not isinstance(max_redirects, int) or isinstance(max_redirects, bool) or max_redirects < 0:
+        raise ValueError("max_redirects must be non-negative")
+
+    if larapaper_base_url is not None:
+        current_url = resolve_image_url(
+            image_url,
+            larapaper_base_url=larapaper_base_url,
+            image_base_url=image_base_url,
+        )
+    else:
+        try:
+            current_url = _normalized_absolute_url(_parse_http_url(image_url))
+        except ImageURLResolutionError:
+            raise ImageTransportError("image URL was invalid") from None
+
+    redirects = 0
+    timeout = ClientTimeout(total=float(timeout_seconds))
+    try:
+        async with asyncio.timeout(float(timeout_seconds)):
+            while True:
+                async with _image_request(session, current_url, timeout=timeout) as response:
+                    status = response.status
+                    if status in REDIRECT_STATUSES:
+                        if redirects >= max_redirects:
+                            raise ImageTransportError("image redirect limit exceeded")
+                        current_url = _redirect_target(
+                            current_url, response.headers.get("Location")
+                        )
+                        redirects += 1
+                        continue
+                    if not 200 <= status < 300:
+                        raise ImageTransportError("image request returned an unexpected status")
+                    body = await response.read()
+                    return ImageResponse(
+                        url=current_url,
+                        status=status,
+                        headers=dict(response.headers),
+                        body=bytes(body),
+                    )
+    except asyncio.CancelledError:
+        raise
+    except ImageTransportError:
+        raise
+    except (ImageURLResolutionError, asyncio.TimeoutError):
+        raise ImageTransportError("image request failed") from None
+    except Exception:
+        raise ImageTransportError("image request failed") from None
 
 
 def image_origin(url: str) -> ImageOrigin:
