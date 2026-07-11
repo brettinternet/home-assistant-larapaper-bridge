@@ -12,9 +12,11 @@ from custom_components.larapaper_bridge.client import (
     SetupCredentials,
 )
 from custom_components.larapaper_bridge.provisioning import (
+    ProvisioningInvalidatedError,
     ProvisioningStateError,
     RETRY_DELAYS_SECONDS,
 )
+from custom_components.larapaper_bridge.storage import InvalidStoredState
 from custom_components.larapaper_bridge.runtime import RuntimeHolder
 
 MAC = "AA:BB:CC:DD:EE:FF"
@@ -260,3 +262,84 @@ async def test_concurrent_provision_calls_share_one_setup(hass):
 
     assert await first == await second
     assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_malformed_store_state_never_retries(hass):
+    store = FakeStore({"version": 1, "mac": MAC, "unexpected": True})
+    client = FakeClient([])
+    runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
+        FakeEntry(ENTRY_DATA), store=store, client=client
+    )
+
+    with pytest.raises(InvalidStoredState):
+        await runtime.async_provision()
+
+    assert client.calls == 0
+    assert store.saves == []
+
+
+@pytest.mark.asyncio
+async def test_store_read_failure_never_retries(hass):
+    class ReadErrorStore(FakeStore):
+        async def async_load(self):
+            raise OSError("store unavailable")
+
+    client = FakeClient([])
+    runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
+        FakeEntry(ENTRY_DATA), store=ReadErrorStore(), client=client
+    )
+
+    with pytest.raises(OSError, match="store unavailable"):
+        await runtime.async_provision()
+
+    assert client.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_store_pending_write_failure_never_retries(hass):
+    class WriteErrorStore(FakeStore):
+        async def async_save_pending(self, mac):
+            raise OSError("store unavailable")
+
+    client = FakeClient([])
+    runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
+        FakeEntry(ENTRY_DATA), store=WriteErrorStore(), client=client
+    )
+
+    with pytest.raises(OSError, match="store unavailable"):
+        await runtime.async_provision()
+
+    assert client.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_late_setup_completion_cannot_persist_after_unload(hass):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class LateClient(FakeClient):
+        async def async_setup(self, mac):
+            self.calls += 1
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+            return SetupCredentials("api-key", "friendly-id")
+
+    store = FakeStore()
+    client = LateClient([])
+    holder = RuntimeHolder.for_hass(hass)
+    runtime = holder.create_entry_runtime(
+        FakeEntry(ENTRY_DATA), store=store, client=client
+    )
+    operation = asyncio.create_task(runtime.async_provision())
+    await started.wait()
+
+    holder.invalidate()
+    release.set()
+
+    with pytest.raises(ProvisioningInvalidatedError):
+        await operation
+    assert store.saves == [("pending", MAC)]
