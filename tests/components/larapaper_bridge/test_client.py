@@ -91,6 +91,28 @@ async def test_display_normalizes_image_and_clamps_interval(
 @pytest.mark.parametrize(
     "body",
     [
+        {"refresh_rate": 15},
+        {"refresh_rate": 15, "image_url": None},
+        {"refresh_rate": 15, "image_url": ""},
+    ],
+)
+async def test_display_normalizes_missing_or_empty_image_url(
+    fake_client: tuple[client.LarapaperClient, FakeSession],
+    body: dict[str, object],
+) -> None:
+    integration, session = fake_client
+    session.response._body = body
+
+    result = await integration.async_display("AA:BB:CC:DD:EE:FF", "secret")
+
+    assert result == client.DisplayResult(None, 60)
+    assert len(session.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
         {"refresh_rate": 0},
         {"refresh_rate": float("nan")},
         {"refresh_rate": 10**1000},
