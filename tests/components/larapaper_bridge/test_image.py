@@ -21,6 +21,7 @@ from custom_components.larapaper_bridge.image import (
     ImageDimensions,
     ImageNetworkPolicy,
     ImageResources,
+    ImageResponse,
     ImageSSRFError,
     ImageTransportError,
     ImageURLResolutionError,
@@ -938,5 +939,68 @@ async def test_image_operation_holds_admission_until_abandoned_worker_finishes(
         if resources._conversion_future is None:
             break
         await asyncio.sleep(0.001)
+    assert resources._conversion_future is None
+    await resources._async_stop(None)
+
+@pytest.mark.asyncio
+async def test_image_operation_keeps_all_prior_generations_abandoned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from custom_components.larapaper_bridge import image as image_module
+
+    fetch_started = asyncio.Event()
+    release_fetch = asyncio.Event()
+    conversions = 0
+
+    async def delayed_fetch(*_args: object, **_kwargs: object) -> ImageResponse:
+        fetch_started.set()
+        await release_fetch.wait()
+        return ImageResponse(
+            url="https://larapaper.example/bridge/image.png",
+            status=200,
+            headers={"Content-Type": "image/png"},
+            body=PNG_BYTES,
+        )
+
+    def conversion(_body: bytes, *, max_image_bytes: int) -> bytes:
+        nonlocal conversions
+        del max_image_bytes
+        conversions += 1
+        return PNG_BYTES
+
+    monkeypatch.setattr(image_module, "async_fetch_image", delayed_fetch)
+    monkeypatch.setattr(image_module, "convert_image_to_png", conversion)
+
+    class FakeBus:
+        def async_listen_once(self, _event: str, _callback: object) -> None:
+            return None
+
+    class FakeHass:
+        bus = FakeBus()
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    resources = ImageResources(
+        FakeHass(),
+        session=FakeImageSession([]),
+        executor=executor,
+        policy=ImageNetworkPolicy.from_urls(BASE),
+    )
+    operation = BoundedImageOperation(
+        resources, larapaper_base_url=BASE, max_image_bytes=100_000
+    )
+    first_token = OperationToken(0, 1)
+    second_token = OperationToken(0, 2)
+    first_task = asyncio.create_task(
+        operation.async_process("/first.png", first_token)
+    )
+
+    await fetch_started.wait()
+    operation.abandon(first_token)
+    operation.abandon(second_token)
+    release_fetch.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await first_task
+    assert conversions == 0
     assert resources._conversion_future is None
     await resources._async_stop(None)

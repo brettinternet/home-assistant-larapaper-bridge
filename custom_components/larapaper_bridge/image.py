@@ -909,14 +909,21 @@ class BoundedImageOperation:
         self.larapaper_base_url = larapaper_base_url
         self.image_base_url = image_base_url
         self.max_image_bytes = max_image_bytes
-        self._abandoned_token: OperationToken | None = None
+        self._abandoned_through: tuple[int, int] | None = None
 
     def abandon(self, token: OperationToken) -> None:
         """Abandon logical work without releasing a running conversion slot."""
-        self._abandoned_token = token
+        marker = (token.lifecycle_epoch, token.cycle_generation)
+        if self._abandoned_through is None or marker > self._abandoned_through:
+            self._abandoned_through = marker
 
     def _is_abandoned(self, token: OperationToken) -> bool:
-        return self._abandoned_token == token
+        """Reject every token at or before the latest abandoned generation."""
+        marker = self._abandoned_through
+        return marker is not None and (
+            token.lifecycle_epoch,
+            token.cycle_generation,
+        ) <= marker
 
     def _fallback_url(self, url: str) -> str:
         try:
