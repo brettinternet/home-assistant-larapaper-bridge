@@ -1,12 +1,12 @@
 {
   "domain": "larapaper_bridge",
   "name": "Larapaper Bridge",
-  "version": "1.0.0",
-  "documentation": "https://github.com/brettinternet/home-assistant-larapaper-bridge",
-  "issue_tracker": "https://github.com/brettinternet/home-assistant-larapaper-bridge/issues",
   "codeowners": ["@brettinternet"],
   "config_flow": true,
+  "documentation": "https://github.com/brettinternet/home-assistant-larapaper-bridge",
   "integration_type": "device",
+  "issue_tracker": "https://github.com/brettinternet/home-assistant-larapaper-bridge/issues",
   "iot_class": "local_polling",
-  "single_config_entry": true
+  "single_config_entry": true,
+  "version": "1.0.0"
 }
