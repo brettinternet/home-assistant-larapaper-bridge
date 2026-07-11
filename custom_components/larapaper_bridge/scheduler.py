@@ -16,6 +16,30 @@ from .runtime import EntryRuntime
 ImageErrorCode = Literal["fetch", "validation", "conversion"]
 Status = Literal["ready", "starting", "stale", "error"]
 
+_ALLOWED_ERROR_CODES = frozenset(
+    {
+        "setup_auto_assign_disabled",
+        "setup_failed",
+        "display_failed",
+        "invalid_display_response",
+        "image_url_missing",
+        "image_fetch_failed",
+        "image_validation_failed",
+        "image_conversion_failed",
+        "internal_error",
+    }
+)
+_IMAGE_ERROR_CODES = {
+    "fetch": "image_fetch_failed",
+    "validation": "image_validation_failed",
+    "conversion": "image_conversion_failed",
+}
+
+
+def _safe_error_code(code: object) -> str:
+    """Collapse unexpected classifications to the safe public fallback."""
+    return code if isinstance(code, str) and code in _ALLOWED_ERROR_CODES else "internal_error"
+
 UTCNow = Callable[[], datetime]
 
 
@@ -146,7 +170,7 @@ class DisplayScheduler:
             settled_at = self.clock()
             if not self.runtime.is_token_current(token):
                 return None
-            self.last_error = error.code
+            self.last_error = _safe_error_code(error.code)
             self.next_display_deadline = settled_at + self._last_effective_interval
             return None
 
@@ -170,7 +194,9 @@ class DisplayScheduler:
                         received_at=self.utc_now(),
                     )
                 elif outcome.error_code is not None:
-                    self.last_error = f"image_{outcome.error_code}_failed"
+                    self.last_error = _IMAGE_ERROR_CODES.get(
+                        outcome.error_code, "internal_error"
+                    )
         return result
 
     def is_cache_fresh(self, now: float | None = None) -> bool:

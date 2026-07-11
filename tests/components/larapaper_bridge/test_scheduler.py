@@ -184,6 +184,42 @@ async def test_missing_image_url_records_safe_error_without_image_work(runtime):
 
 
 @pytest.mark.asyncio
+async def test_diagnostics_collapses_unknown_client_error(runtime):
+    clock = FakeClock()
+    display = FakeDisplay(clock)
+    display.failure = LarapaperClientError("secret-leak", "unsafe")
+    scheduler = DisplayScheduler(
+        runtime, api_key="secret", display_client=display, clock=clock
+    )
+
+    await scheduler.async_run_cycle()
+
+    assert scheduler.diagnostics_state().last_error == "internal_error"
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_collapses_unknown_image_error(runtime):
+    clock = FakeClock()
+    display = FakeDisplay(clock)
+
+    class InvalidImage(FakeImage):
+        async def async_process(self, url: str, token: OperationToken) -> ImageOutcome:
+            return ImageOutcome(error_code="secret-leak", resolved_url=url)
+
+    scheduler = DisplayScheduler(
+        runtime,
+        api_key="secret",
+        display_client=display,
+        image_operation=InvalidImage(clock),
+        clock=clock,
+    )
+
+    await scheduler.async_run_cycle()
+
+    assert scheduler.diagnostics_state().last_error == "internal_error"
+
+
+@pytest.mark.asyncio
 async def test_late_image_success_after_unload_cannot_publish_cache(runtime):
     clock = FakeClock()
     display = FakeDisplay(clock)
