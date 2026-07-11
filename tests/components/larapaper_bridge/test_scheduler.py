@@ -75,13 +75,43 @@ class FakeImage:
 
     def abandon(self, token: OperationToken) -> None:
         raise AssertionError("abandonment is not part of cache tests")
+class SequenceImage:
+    def __init__(self, outcomes: list[ImageOutcome]) -> None:
+        self.outcomes = outcomes
+        self.calls: list[tuple[str, OperationToken]] = []
+        self.abandoned: list[OperationToken] = []
+
+    async def async_process(self, url: str, token: OperationToken) -> ImageOutcome:
+        self.calls.append((url, token))
+        return self.outcomes.pop(0)
+
+    def abandon(self, token: OperationToken) -> None:
+        self.abandoned.append(token)
+
+
+class BlockingImage:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.abandoned: list[OperationToken] = []
+
+    async def async_process(self, url: str, token: OperationToken) -> ImageOutcome:
+        self.started.set()
+        await self.release.wait()
+        return ImageOutcome(png_bytes=b"late", resolved_url=url)
+
+    def abandon(self, token: OperationToken) -> None:
+        self.abandoned.append(token)
+
 
 
 @pytest.fixture
 def runtime(hass):
-    return RuntimeHolder.for_hass(hass).create_entry_runtime(
+    runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
         FakeEntry(ENTRY_DATA), store=FakeStore(), client=FakeRuntimeClient()
     )
+    yield runtime
+    runtime.holder.invalidate()
 
 
 @pytest.mark.asyncio
@@ -164,6 +194,72 @@ async def test_diagnostics_projection_uses_precedence_and_monotonic_age(runtime)
     assert stale.stale is True
     assert stale.last_success_age_seconds == 10
     assert stale.last_error == "display_failed"
+
+@pytest.mark.asyncio
+async def test_image_retry_reuses_captured_url_and_stops_at_display_deadline(runtime):
+    clock = FakeClock()
+    display = FakeDisplay(clock)
+    image = SequenceImage(
+        [
+            ImageOutcome(error_code="fetch", resolved_url="https://cdn.test/a.png"),
+            ImageOutcome(error_code="validation", resolved_url="https://cdn.test/a.png"),
+        ]
+    )
+    gates = [asyncio.Event(), asyncio.Event()]
+    sleep_calls: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+        await gates[len(sleep_calls) - 1].wait()
+
+    scheduler = DisplayScheduler(
+        runtime,
+        api_key="secret",
+        display_client=display,
+        image_operation=image,
+        clock=clock,
+        sleep=sleep,
+    )
+
+    await scheduler.async_run_cycle()
+    scheduler.next_display_deadline = 110.0
+    await asyncio.sleep(0)
+    assert scheduler.next_retry_deadline == 105.0
+
+    clock.value = 105.0
+    gates[0].set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert image.calls == [
+        ("/image.png", OperationToken(0, 1)),
+        ("https://cdn.test/a.png", OperationToken(0, 1)),
+    ]
+    assert sleep_calls == [5.0]
+    assert scheduler.next_retry_deadline is None
+    assert scheduler.diagnostics_state().last_error == "image_validation_failed"
+
+
+@pytest.mark.asyncio
+async def test_unload_abandons_blocked_image_and_rejects_late_publication(runtime):
+    clock = FakeClock()
+    display = FakeDisplay(clock)
+    image = BlockingImage()
+    scheduler = DisplayScheduler(
+        runtime,
+        api_key="secret",
+        display_client=display,
+        image_operation=image,
+        clock=clock,
+    )
+
+    cycle = asyncio.create_task(scheduler.async_run_cycle())
+    await image.started.wait()
+    runtime.holder.invalidate()
+    assert image.abandoned == [OperationToken(0, 1)]
+
+    image.release.set()
+    assert await cycle == DisplayResult("/image.png", 60.0)
+    assert scheduler.cache_record == CacheRecord()
 
 
 @pytest.mark.asyncio

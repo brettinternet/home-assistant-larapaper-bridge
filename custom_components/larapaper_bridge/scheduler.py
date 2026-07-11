@@ -127,6 +127,8 @@ Sleep = Callable[[float], Awaitable[None]]
 class DisplayScheduler:
     """Run one display call per cycle using settlement-anchored deadlines."""
 
+    _RETRY_DELAYS = (5.0, 10.0, 20.0, 40.0, 60.0)
+
     def __init__(
         self,
         runtime: EntryRuntime,
@@ -149,6 +151,7 @@ class DisplayScheduler:
             runtime.config_entry.data.get(CONF_MAX_STALE_SECONDS, 3600)
         )
         self.next_display_deadline: float | None = None
+        self.next_retry_deadline: float | None = None
         self.last_display_result: DisplayResult | None = None
         self.last_error: str | None = None
         self.cache_record = CacheRecord()
@@ -156,10 +159,19 @@ class DisplayScheduler:
             runtime.config_entry.data[CONF_MIN_POLL_SECONDS]
         )
         self._task: asyncio.Task[None] | None = None
+        self._image_task: asyncio.Task[None] | None = None
+        self._image_token: OperationToken | None = None
+        self._retry_task: asyncio.Task[None] | None = None
+        self._retry_token: OperationToken | None = None
+        self._retry_url: str | None = None
+        self._retry_attempt = 0
+        runtime.scheduler = self
 
-    async def async_run_cycle(self) -> DisplayResult | None:
+    async def async_run_cycle(
+        self, *, wait_for_image: bool = True
+    ) -> DisplayResult | None:
         """Run one display request and settle its next deadline."""
-        token = self.runtime.begin_cycle()
+        token = self._begin_cycle()
         try:
             result = await self.display_client.async_display(
                 self.runtime.mac, self.api_key
@@ -182,22 +194,120 @@ class DisplayScheduler:
         self.next_display_deadline = settled_at + self._last_effective_interval
 
         if result.image_url is None:
-            if self.runtime.is_token_current(token):
-                self.last_error = "image_url_missing"
+            self.last_error = "image_url_missing"
         elif self.image_operation is not None:
-            outcome = await self.image_operation.async_process(result.image_url, token)
-            if self.runtime.is_token_current(token):
-                if outcome.png_bytes is not None:
-                    self.cache_record = CacheRecord(
-                        png_bytes=outcome.png_bytes,
-                        received_monotonic=self.clock(),
-                        received_at=self.utc_now(),
-                    )
-                elif outcome.error_code is not None:
-                    self.last_error = _IMAGE_ERROR_CODES.get(
-                        outcome.error_code, "internal_error"
-                    )
+            if wait_for_image:
+                self._image_token = token
+                await self._process_image(result.image_url, token)
+            else:
+                self._image_token = token
+                self._image_task = self.runtime.create_task(
+                    self._process_image(result.image_url, token)
+                )
         return result
+
+    def _begin_cycle(self) -> OperationToken:
+        """Advance generation before abandoning all prior cycle work."""
+        token = self.runtime.begin_cycle()
+        self._abandon_current_work()
+        return token
+
+    def _abandon_current_work(self) -> None:
+        """Cancel logical work and synchronously abandon image processing."""
+        image_token = self._image_token
+        if self._image_task is not None:
+            self._image_task.cancel()
+        if image_token is not None and self.image_operation is not None:
+            self.image_operation.abandon(image_token)
+        if self._retry_task is not None:
+            self._retry_task.cancel()
+        self._image_task = None
+        self._image_token = None
+        self._retry_task = None
+        self._retry_token = None
+        self._retry_url = None
+        self._retry_attempt = 0
+        self.next_retry_deadline = None
+
+    async def _process_image(self, url: str, token: OperationToken) -> None:
+        """Process one URL and schedule only retries before the next cycle."""
+        if not self.runtime.is_token_current(token) or self.image_operation is None:
+            return
+        try:
+            outcome = await self.image_operation.async_process(url, token)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            outcome = ImageOutcome(error_code="conversion", resolved_url=url)
+        if not self.runtime.is_token_current(token):
+            return
+        self._image_task = None
+        self._image_token = None
+        if outcome.png_bytes is not None:
+            self.cache_record = CacheRecord(
+                png_bytes=outcome.png_bytes,
+                received_monotonic=self.clock(),
+                received_at=self.utc_now(),
+            )
+            self.last_error = None
+            self._clear_retry()
+            return
+        if outcome.error_code is not None:
+            self.last_error = _IMAGE_ERROR_CODES.get(
+                outcome.error_code, "internal_error"
+            )
+            self._schedule_retry(outcome.resolved_url, token)
+
+    def _schedule_retry(self, url: str | None, token: OperationToken) -> None:
+        """Schedule a captured-URL retry only before the display deadline."""
+        if (
+            not url
+            or self.next_display_deadline is None
+            or not self.runtime.is_token_current(token)
+        ):
+            return
+        delay = self._RETRY_DELAYS[min(self._retry_attempt, len(self._RETRY_DELAYS) - 1)]
+        due = self.clock() + delay
+        if due >= self.next_display_deadline:
+            return
+        self._retry_attempt += 1
+        self._retry_token = token
+        self._retry_url = url
+        self.next_retry_deadline = due
+        self._retry_task = self.runtime.create_task(self._run_retry(token, url, due))
+
+    async def _run_retry(
+        self, token: OperationToken, url: str, due: float
+    ) -> None:
+        """Wait for and execute a captured-URL image retry."""
+        try:
+            await self.sleep(max(0.0, due - self.clock()))
+            if (
+                not self.runtime.is_token_current(token)
+                or self.next_display_deadline is None
+                or self.clock() >= self.next_display_deadline
+                or self.image_operation is None
+            ):
+                return
+            self.next_retry_deadline = None
+            self._retry_task = None
+            self._image_token = token
+            await self._process_image(url, token)
+        finally:
+            if self._retry_token == token and self._retry_task is asyncio.current_task():
+                self._retry_token = None
+                self._retry_url = None
+                self._retry_task = None
+                self.next_retry_deadline = None
+
+    def _clear_retry(self) -> None:
+        if self._retry_task is not None:
+            self._retry_task.cancel()
+        self._retry_task = None
+        self._retry_token = None
+        self._retry_url = None
+        self._retry_attempt = 0
+        self.next_retry_deadline = None
 
     def is_cache_fresh(self, now: float | None = None) -> bool:
         """Return whether the last-good image is strictly inside its stale limit."""
@@ -239,6 +349,11 @@ class DisplayScheduler:
             if self.next_display_deadline is not None
             else None
         )
+        next_retry_at = (
+            now_utc + timedelta(seconds=self.next_retry_deadline - current)
+            if self.next_retry_deadline is not None
+            else None
+        )
         return DiagnosticsState(
             status=status,
             ready=fresh,
@@ -247,7 +362,7 @@ class DisplayScheduler:
             last_success_age_seconds=int(age) if age is not None else None,
             last_error=self.last_error,
             next_display_at=next_display_at,
-            next_retry_at=None,
+            next_retry_at=next_retry_at,
         )
 
     def async_start(self) -> asyncio.Task[None]:
@@ -259,16 +374,16 @@ class DisplayScheduler:
 
     async def _run(self) -> None:
         while self.runtime.is_current():
-            await self.async_run_cycle()
+            await self.async_run_cycle(wait_for_image=False)
             if not self.runtime.is_current() or self.next_display_deadline is None:
                 return
             await self.sleep(max(0.0, self.next_display_deadline - self.clock()))
 
     def stop(self) -> None:
-        """Cancel the scheduler loop without waiting for display I/O."""
+        """Cancel the scheduler loop and abandon image work without waiting."""
+        self._abandon_current_work()
         if self._task is not None:
             self._task.cancel()
-
 
 __all__ = [
     "CacheRecord",

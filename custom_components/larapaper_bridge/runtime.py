@@ -61,10 +61,9 @@ class RuntimeHolder:
         """Fence and cancel the current entry, then advance the epoch."""
         current = self.current
         self.current = None
+        self.lifecycle_epoch += 1
         if current is not None:
             current._invalidate()
-        self.lifecycle_epoch += 1
-
 
 class EntryRuntime:
     """Own one entry's cancellable tasks and provisioning operation."""
@@ -88,6 +87,7 @@ class EntryRuntime:
         self.stopped = False
         self.tasks: set[asyncio.Task[Any]] = set()
         self.retry_handles: set[asyncio.TimerHandle] = set()
+        self.scheduler: Any | None = None
         self._provisioner = Provisioner(
             store=store,
             client=client,
@@ -169,6 +169,8 @@ class EntryRuntime:
         if self.stopped:
             return
         self.stopped = True
+        if self.scheduler is not None:
+            self.scheduler.stop()
         for task in tuple(self.tasks):
             task.cancel()
         for handle in tuple(self.retry_handles):
