@@ -37,7 +37,7 @@ class FakeStore:
         self.state = state
         self.saves: list[tuple[str, ...]] = []
 
-    async def async_load(self):
+    async def async_load_identity(self, _mac):
         return self.state
 
     async def async_save_pending(self, mac):
@@ -307,7 +307,7 @@ async def test_malformed_store_state_never_retries(hass):
 @pytest.mark.asyncio
 async def test_store_read_failure_never_retries(hass):
     class ReadErrorStore(FakeStore):
-        async def async_load(self):
+        async def async_load_identity(self, _mac):
             raise OSError("store unavailable")
 
     client = FakeClient([])

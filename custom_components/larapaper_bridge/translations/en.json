@@ -21,11 +21,10 @@
       "invalid_min_poll_seconds": "Enter a finite positive number.",
       "invalid_max_stale_seconds": "Enter a positive integer.",
       "invalid_max_image_bytes": "Enter a positive integer.",
-      "invalid_stored_state": "Stored identity state is invalid.",
-      "mac_mismatch": "The MAC does not match the stored identity."
+      "invalid_stored_state": "Stored identity state is invalid."
     },
     "abort": {
-      "single_instance_allowed": "Only one Larapaper Bridge device is supported."
+      "already_configured": "This device is already configured."
     }
   }
 }

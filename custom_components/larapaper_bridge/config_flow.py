@@ -9,7 +9,7 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult
 
 from .const import (
     CONF_BASE_URL,
@@ -29,9 +29,13 @@ from .const import (
     ERROR_INVALID_MAX_STALE_SECONDS,
     ERROR_INVALID_MIN_POLL_SECONDS,
     ERROR_INVALID_STORED_STATE,
-    ERROR_MAC_MISMATCH,
 )
-from .storage import InvalidStoredState, LarapaperStore, canonicalize_mac
+from .storage import (
+    IdentityAlreadyConfigured,
+    InvalidStoredState,
+    LarapaperStore,
+    canonicalize_mac,
+)
 
 
 def _split_http_url(value: str, *, field: str) -> SplitResult:
@@ -144,7 +148,7 @@ def _schema() -> vol.Schema:
 class LarapaperBridgeConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle Larapaper Bridge configuration."""
 
-    VERSION = 1
+    VERSION = 2
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -158,31 +162,30 @@ class LarapaperBridgeConfigFlow(ConfigFlow, domain=DOMAIN):
                 field = str(err)
                 errors[field] = self._error_for_field(field)
             else:
-                await self.async_set_unique_id(DOMAIN)
-                self._abort_if_unique_id_configured()
+                store = LarapaperStore(self.hass)
+                configured_unique_ids = {
+                    entry.unique_id
+                    for entry in self.hass.config_entries.async_entries(DOMAIN)
+                    if entry.unique_id
+                }
                 try:
-                    store = LarapaperStore(self.hass)
-                    persisted = await store.async_load()
-                except InvalidStoredState:
-                    errors["base"] = ERROR_INVALID_STORED_STATE
-                else:
-                    configured_mac = data[CONF_MAC]
-                    persisted_mac = persisted[CONF_MAC] if persisted else None
-                    if (
-                        configured_mac is not None
-                        and persisted_mac is not None
-                        and configured_mac != persisted_mac
-                    ):
-                        errors[CONF_MAC] = ERROR_MAC_MISMATCH
-                    else:
-                        mac = configured_mac or persisted_mac or _generate_mac()
-                        data[CONF_MAC] = mac
-                        if persisted is None:
-                            await store.async_save_pending(mac)
+                    async with store.async_flow_transaction() as transaction:
+                        selection = await transaction.async_claim(
+                            data[CONF_MAC],
+                            configured_unique_ids,
+                            _generate_mac,
+                        )
+                        await self.async_set_unique_id(selection.mac)
+                        self._abort_if_unique_id_configured()
+                        data[CONF_MAC] = selection.mac
                         return self.async_create_entry(
-                            title="Larapaper Bridge",
+                            title=selection.mac,
                             data=data,
                         )
+                except IdentityAlreadyConfigured:
+                    return self.async_abort(reason="already_configured")
+                except InvalidStoredState:
+                    errors["base"] = ERROR_INVALID_STORED_STATE
 
         return self.async_show_form(
             step_id="user",
@@ -249,3 +252,22 @@ class LarapaperBridgeConfigFlow(ConfigFlow, domain=DOMAIN):
             CONF_MAX_STALE_SECONDS: ERROR_INVALID_MAX_STALE_SECONDS,
             CONF_MAX_IMAGE_BYTES: ERROR_INVALID_MAX_IMAGE_BYTES,
         }.get(field, ERROR_INVALID_BASE_URL)
+
+
+async def async_migrate_entry(hass: Any, config_entry: ConfigEntry) -> bool:
+    """Migrate the V1 config entry and identity payload atomically."""
+    if config_entry.version != 1:
+        return True
+    try:
+        mac = canonicalize_mac(config_entry.data[CONF_MAC])
+    except (KeyError, ValueError) as err:
+        raise InvalidStoredState("config entry has an invalid MAC") from err
+    identity = await LarapaperStore(hass).async_migrate_v1(mac)
+    title = identity.get("friendly_id", mac)
+    hass.config_entries.async_update_entry(
+        config_entry,
+        version=2,
+        unique_id=mac,
+        title=title,
+    )
+    return True

@@ -35,7 +35,6 @@ def test_manifest_and_translation_resources() -> None:
         "config_flow": True,
         "integration_type": "device",
         "iot_class": "local_polling",
-        "single_config_entry": True,
     }
     json.loads((INTEGRATION / "strings.json").read_text())
     json.loads((INTEGRATION / "translations" / "en.json").read_text())

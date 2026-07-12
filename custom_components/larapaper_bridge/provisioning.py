@@ -128,7 +128,7 @@ class Provisioner:
     ) -> dict[str, Any] | None:
         await self._ensure_active(is_active)
         try:
-            raw_state = await self._store.async_load()
+            raw_state = await self._store.async_load_identity(mac)
         except asyncio.CancelledError:
             raise
         except InvalidStoredState:

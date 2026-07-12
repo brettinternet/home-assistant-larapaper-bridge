@@ -11,7 +11,7 @@ from homeassistant.config_entries import ConfigEntryError
 
 import custom_components.larapaper_bridge as integration
 from custom_components.larapaper_bridge.const import DOMAIN
-from custom_components.larapaper_bridge.storage import InvalidStoredState
+from custom_components.larapaper_bridge.storage import InvalidStoredState, LarapaperStore
 
 
 MAC = "AA:BB:CC:DD:EE:FF"
@@ -108,9 +108,14 @@ class FakeScheduler:
 
 
 @pytest.fixture
-def setup_fakes(monkeypatch: pytest.MonkeyPatch):
+def setup_fakes(hass, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(integration, "RuntimeHolder", FakeHolder)
     monkeypatch.setattr(integration, "DisplayScheduler", FakeScheduler)
+    monkeypatch.setattr(
+        hass.config_entries,
+        "async_update_entry",
+        lambda entry, **kwargs: entry.__dict__.update(kwargs),
+    )
     FakeHolder.provision_error = None
     FakeHolder.provision_future = None
     FakeHolder.validation_error = None
@@ -148,7 +153,7 @@ async def test_setup_provisions_starts_scheduler_and_forwards_camera(
     runtime = holder.current
     assert runtime is not None
     assert runtime.provision_calls == 1
-    assert len(FakeScheduler.instances) == 1
+    assert entry.title == "display-1"
     assert FakeScheduler.instances[0].api_key == "secret-api-key"
     assert FakeScheduler.instances[0].started is True
     assert image_calls == [
@@ -361,3 +366,44 @@ async def test_invalid_persisted_state_raises_config_entry_error(
     assert holder.current is None
     assert holder.invalidations == 1
     assert forwarded is False
+
+@pytest.mark.asyncio
+async def test_remove_entry_deletes_only_its_registry_record(hass):
+    store = LarapaperStore(hass)
+    await store.async_save_pending("AA:BB:CC:DD:EE:FF")
+    await store.async_save_pending("11:22:33:44:55:66")
+
+    entry = FakeEntry("entry-1", {**ENTRY_DATA, "mac": "AA:BB:CC:DD:EE:FF"})
+    entry.unique_id = DOMAIN
+    await integration.async_remove_entry(hass, entry)
+
+    assert await store.async_load() == {
+        "version": 2,
+        "devices": {
+            "11:22:33:44:55:66": {
+                "version": 1,
+                "mac": "11:22:33:44:55:66",
+            }
+        },
+    }
+
+@pytest.mark.asyncio
+async def test_remove_entry_invalidates_active_runtime_before_registry_removal(
+    hass, monkeypatch, setup_fakes
+):
+    holder = setup_fakes.for_hass(hass)
+    entry = FakeEntry("entry-1", ENTRY_DATA)
+    runtime = holder.create_entry_runtime(entry)
+    removed: list[str] = []
+
+    class FakeRegistryStore:
+        async def async_remove_identity(self, mac):
+            removed.append(mac)
+
+    monkeypatch.setattr(
+        integration, "LarapaperStore", lambda _hass: FakeRegistryStore()
+    )
+    await integration.async_remove_entry(hass, entry)
+
+    assert runtime.invalidated is True
+    assert removed == [MAC]

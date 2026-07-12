@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 
-from homeassistant.config_entries import ConfigEntry, ConfigEntryError
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import ConfigEntryError
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
+from .config_flow import async_migrate_entry
 from .const import (
     CONF_BASE_URL,
     CONF_IMAGE_BASE_URL,
+    CONF_MAC,
     CONF_MAX_IMAGE_BYTES,
     DOMAIN,
 )
@@ -18,7 +21,7 @@ from .image import async_create_image_operation
 from .runtime import EntryRuntime, RuntimeHolder
 from .provisioning import ProvisioningStateError
 from .scheduler import DisplayScheduler
-from .storage import InvalidStoredState
+from .storage import InvalidStoredState, LarapaperStore, canonicalize_mac
 PLATFORMS = [Platform.CAMERA]
 
 
@@ -28,6 +31,10 @@ async def _async_initialize_entry(hass: HomeAssistant, runtime: EntryRuntime) ->
         credentials = await runtime.async_provision()
         if not runtime.is_current():
             return
+        hass.config_entries.async_update_entry(
+            runtime.config_entry,
+            title=credentials["friendly_id"],
+        )
         image_operation = await async_create_image_operation(
             hass,
             larapaper_base_url=runtime.config_entry.data[CONF_BASE_URL],
@@ -76,7 +83,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     task.add_done_callback(_consume_initialization_result)
     return True
 
-
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Fence the entry before unloading its platforms."""
     holder = hass.data.get(DOMAIN)
@@ -86,4 +92,33 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             holder.invalidate()
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
-__all__ = ["PLATFORMS", "async_setup_entry", "async_unload_entry"]
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Remove only the entry's identity from the shared registry."""
+    identity = getattr(entry, "unique_id", None)
+    holder = hass.data.get(DOMAIN)
+    if (
+        isinstance(holder, RuntimeHolder)
+        and holder.current is not None
+        and holder.current.config_entry is entry
+    ):
+        holder.invalidate()
+    try:
+        mac = canonicalize_mac(identity) if identity else None
+    except ValueError:
+        mac = None
+    if mac is None:
+        try:
+            mac = canonicalize_mac(entry.data[CONF_MAC])
+        except (KeyError, ValueError):
+            return
+    await LarapaperStore(hass).async_remove_identity(mac)
+
+
+__all__ = [
+    "PLATFORMS",
+    "async_migrate_entry",
+    "async_remove_entry",
+    "async_setup_entry",
+    "async_unload_entry",
+]
