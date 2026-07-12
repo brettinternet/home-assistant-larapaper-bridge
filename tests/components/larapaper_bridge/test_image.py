@@ -313,6 +313,21 @@ def test_resolve_relative_paths_preserves_larapaper_prefix(
     assert resolve_image_url(image_url, larapaper_base_url=BASE) == expected
 
 
+@pytest.mark.parametrize(
+    "image_url",
+    [
+        "/../secret.png",
+        "../secret.png",
+        "/%2e%2e/secret.png",
+        "%2E%2E/secret.png",
+        "/%2e%2f%2e%2e/secret.png",
+    ],
+)
+def test_rejects_relative_dot_segments(image_url: str) -> None:
+    with pytest.raises(ImageURLResolutionError):
+        resolve_image_url(image_url, larapaper_base_url=BASE)
+
+
 def test_absolute_source_preserves_path_and_query() -> None:
     assert (
         resolve_image_url(

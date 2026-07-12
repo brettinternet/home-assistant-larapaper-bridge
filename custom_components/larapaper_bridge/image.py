@@ -19,7 +19,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
+from urllib.parse import SplitResult, unquote, urljoin, urlsplit, urlunsplit
 
 from aiohttp import ClientSession, ClientTimeout, DummyCookieJar, TCPConnector
 from aiohttp.abc import AbstractResolver, ResolveResult
@@ -157,6 +157,12 @@ def _normalized_absolute_url(parsed: SplitResult, *, scheme: str | None = None) 
     return urlunsplit((selected_scheme, authority, parsed.path, parsed.query, ""))
 
 
+def _reject_dot_segments(path: str) -> None:
+    """Reject literal or percent-encoded path traversal segments."""
+    if any(segment in {".", ".."} for segment in unquote(path).split("/")):
+        raise ImageURLResolutionError
+
+
 def resolve_image_url(
     image_url: str,
     *,
@@ -181,6 +187,7 @@ def resolve_image_url(
         resolved = _normalized_absolute_url(source, scheme=source.scheme or base.scheme)
     else:
         path = source.path[1:] if source.path.startswith("/") else source.path
+        _reject_dot_segments(source.path)
         resolved = urlunsplit(
             (
                 base.scheme.lower(),
