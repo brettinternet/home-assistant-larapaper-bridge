@@ -1,0 +1,18 @@
+[tools]
+python = "3.14"
+uv = "latest"
+node = "latest"
+bun = "latest"
+direnv = "latest"
+"npm:pyright" = "latest"
+colima = "latest"
+docker-cli = "latest"
+
+[tools.docker-compose]
+version = "latest"
+postinstall = '''
+mkdir -p ~/.docker/cli-plugins ~/.local/bin
+compose_plugin="$(which docker-cli-plugin-docker-compose)"
+ln -sf "$compose_plugin" ~/.docker/cli-plugins/docker-compose
+ln -sf "$compose_plugin" ~/.local/bin/docker-compose
+'''
