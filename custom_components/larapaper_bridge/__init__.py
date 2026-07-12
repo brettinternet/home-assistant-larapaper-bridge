@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.exceptions import ConfigEntryError
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import device_registry as dr
 
 from .config_flow import async_migrate_entry
 from .const import (
@@ -35,6 +36,17 @@ async def _async_initialize_entry(hass: HomeAssistant, runtime: EntryRuntime) ->
             runtime.config_entry,
             title=credentials["friendly_id"],
         )
+        registry = dr.async_get(hass)
+        device = registry.async_get_device(
+            identifiers={(DOMAIN, runtime.mac)}
+        )
+        if device is not None:
+            registry.async_update_device(
+                device.id,
+                name=credentials["friendly_id"],
+                manufacturer="Larapaper",
+            )
+        runtime.notify_camera_state()
         image_operation = await async_create_image_operation(
             hass,
             larapaper_base_url=runtime.config_entry.data[CONF_BASE_URL],
@@ -49,6 +61,7 @@ async def _async_initialize_entry(hass: HomeAssistant, runtime: EntryRuntime) ->
             image_operation=image_operation,
         )
         scheduler.async_start()
+        runtime.notify_camera_state()
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -70,14 +83,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         await runtime.async_validate_persisted_state()
     except (InvalidStoredState, ProvisioningStateError) as error:
-        if holder.current is runtime:
-            holder.invalidate()
+        if holder.get_entry_runtime(entry) is runtime:
+            holder.invalidate_entry(entry, expected_runtime=runtime)
         raise ConfigEntryError("invalid persisted Larapaper identity") from error
     try:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     except Exception:
-        if holder.current is runtime:
-            holder.invalidate()
+        if holder.get_entry_runtime(entry) is runtime:
+            holder.invalidate_entry(entry, expected_runtime=runtime)
         raise
     task = runtime.create_task(_async_initialize_entry(hass, runtime))
     task.add_done_callback(_consume_initialization_result)
@@ -87,9 +100,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Fence the entry before unloading its platforms."""
     holder = hass.data.get(DOMAIN)
     if isinstance(holder, RuntimeHolder):
-        runtime = holder.current
+        runtime = holder.get_entry_runtime(entry)
         if runtime is not None and runtime.config_entry is entry:
-            holder.invalidate()
+            holder.invalidate_entry(entry, expected_runtime=runtime)
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 
@@ -97,12 +110,10 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Remove only the entry's identity from the shared registry."""
     identity = getattr(entry, "unique_id", None)
     holder = hass.data.get(DOMAIN)
-    if (
-        isinstance(holder, RuntimeHolder)
-        and holder.current is not None
-        and holder.current.config_entry is entry
-    ):
-        holder.invalidate()
+    if isinstance(holder, RuntimeHolder):
+        runtime = holder.get_entry_runtime(entry)
+        if runtime is not None and runtime.config_entry is entry:
+            holder.invalidate_entry(entry, expected_runtime=runtime)
     try:
         mac = canonicalize_mac(identity) if identity else None
     except ValueError:

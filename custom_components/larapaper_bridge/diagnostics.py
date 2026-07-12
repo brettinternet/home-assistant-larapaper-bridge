@@ -62,8 +62,8 @@ async def async_get_config_entry_diagnostics(
     holder = hass.data.get(DOMAIN)
     state = _empty_state()
     if isinstance(holder, RuntimeHolder):
-        runtime = holder.current
-        if runtime is not None and runtime.config_entry is entry:
+        runtime = holder.get_entry_runtime(entry)
+        if runtime is not None:
             if runtime.scheduler is not None:
                 state = runtime.scheduler.diagnostics_state()
             else:

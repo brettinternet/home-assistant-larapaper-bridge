@@ -37,7 +37,7 @@ EXPECTED_KEYS = {
 class FakeEntry:
     entry_id: str
     data: dict[str, object]
-
+    title: str = MAC
 
 class FakeStore:
     async def async_load(self):
@@ -76,7 +76,7 @@ def diagnostics_runtime(hass):
         utc_now=lambda: now,
     )
     yield runtime, scheduler, clock, now
-    runtime.holder.invalidate()
+    runtime.holder.invalidate_entry("entry-1")
 
 
 @pytest.mark.asyncio
@@ -190,4 +190,34 @@ async def test_diagnostics_reports_provisioning_error_before_scheduler_exists(ha
     assert result["status"] == "error"
     assert result["ready"] is False
     assert result["last_error"] == "setup_auto_assign_disabled"
-    runtime.holder.invalidate()
+    runtime.holder.invalidate_entry("entry-1")
+
+@pytest.mark.asyncio
+async def test_diagnostics_selects_only_requested_entry_runtime(hass):
+    second_mac = "11:22:33:44:55:66"
+    first_entry = FakeEntry("entry-1", ENTRY_DATA)
+    second_entry = FakeEntry(
+        "entry-2",
+        {**ENTRY_DATA, "mac": second_mac},
+    )
+    holder = RuntimeHolder.for_hass(hass)
+    first = holder.create_entry_runtime(
+        first_entry, store=FakeStore(), client=FakeClient()
+    )
+    second = holder.create_entry_runtime(
+        second_entry, store=FakeStore(), client=FakeClient()
+    )
+    DisplayScheduler(first, api_key="first")
+    second_scheduler = DisplayScheduler(second, api_key="second")
+    second_scheduler.last_error = "display_failed"
+
+    first_result = await async_get_config_entry_diagnostics(hass, first_entry)
+    second_result = await async_get_config_entry_diagnostics(hass, second_entry)
+
+    assert first_result["status"] == "starting"
+    assert first_result["last_error"] is None
+    assert second_result["status"] == "error"
+    assert second_result["last_error"] == "display_failed"
+
+    holder.invalidate_entry("entry-1")
+    holder.invalidate_entry("entry-2")

@@ -29,7 +29,9 @@ ENTRY_DATA = {
 
 @dataclass
 class FakeEntry:
+    entry_id: str
     data: dict[str, object]
+    title: str = MAC
 
 
 class FakeStore:
@@ -83,7 +85,7 @@ async def test_provisioning_persists_pending_before_setup_and_complete_after(has
     client = FakeClient([SetupCredentials("api-key", "friendly-id")])
     holder = RuntimeHolder.for_hass(hass)
     runtime = holder.create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=store, client=client
+        FakeEntry("entry-1", ENTRY_DATA), store=store, client=client
     )
 
     result = await runtime.async_provision()
@@ -113,7 +115,7 @@ async def test_complete_state_bypasses_setup(hass):
     )
     client = FakeClient([])
     runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=store, client=client
+        FakeEntry("entry-1", ENTRY_DATA), store=store, client=client
     )
 
     assert await runtime.async_provision() == store.state
@@ -132,7 +134,7 @@ async def test_retries_with_fixed_backoff_and_observes_complete_state(hass):
     )
     sleep = FakeSleep()
     runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=store, client=client, sleep=sleep
+        FakeEntry("entry-1", ENTRY_DATA), store=store, client=client, sleep=sleep
     )
     operation = asyncio.create_task(runtime.async_provision())
     for _ in range(3):
@@ -161,7 +163,7 @@ async def test_generic_provisioning_failure_is_reported_and_cleared_after_retry(
     )
     sleep = FakeSleep()
     runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=store, client=client, sleep=sleep
+        FakeEntry("entry-1", ENTRY_DATA), store=store, client=client, sleep=sleep
     )
     operation = asyncio.create_task(runtime.async_provision())
     for _ in range(3):
@@ -178,7 +180,7 @@ async def test_pending_state_is_reused_after_restart(hass):
     store = FakeStore({"version": 1, "mac": MAC})
     client = FakeClient([SetupCredentials("api-key", "friendly-id")])
     runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=store, client=client
+        FakeEntry("entry-1", ENTRY_DATA), store=store, client=client
     )
 
     await runtime.async_provision()
@@ -191,7 +193,7 @@ async def test_mismatched_persisted_mac_never_retries(hass):
     store = FakeStore({"version": 1, "mac": "11:22:33:44:55:66"})
     client = FakeClient([])
     runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=store, client=client
+        FakeEntry("entry-1", ENTRY_DATA), store=store, client=client
     )
 
     with pytest.raises(ProvisioningStateError):
@@ -207,21 +209,21 @@ async def test_unload_cancels_provisioning_and_advances_epoch(hass):
     sleep = FakeSleep()
     holder = RuntimeHolder.for_hass(hass)
     runtime = holder.create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=store, client=client, sleep=sleep
+        FakeEntry("entry-1", ENTRY_DATA), store=store, client=client, sleep=sleep
     )
     operation = asyncio.create_task(runtime.async_provision())
     for _ in range(3):
         await asyncio.sleep(0)
     assert runtime.tasks
-    old_epoch = holder.lifecycle_epoch
+    old_epoch = runtime.lifecycle_epoch
 
-    holder.invalidate()
+    holder.invalidate_entry("entry-1")
 
     with pytest.raises(asyncio.CancelledError):
         await operation
     assert runtime.stopped is True
-    assert holder.lifecycle_epoch == old_epoch + 1
-    assert holder.current is None
+    assert holder.lifecycle_epochs["entry-1"] == old_epoch + 1
+    assert holder.get_entry_runtime("entry-1") is None
     assert not runtime.tasks
 
 
@@ -231,7 +233,7 @@ async def test_unload_cancels_registered_retry_handle(hass):
     client = FakeClient([LarapaperClientError("setup_failed", "safe")])
     holder = RuntimeHolder.for_hass(hass)
     runtime = holder.create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=store, client=client
+        FakeEntry("entry-1", ENTRY_DATA), store=store, client=client
     )
     operation = asyncio.create_task(runtime.async_provision())
     for _ in range(3):
@@ -239,7 +241,7 @@ async def test_unload_cancels_registered_retry_handle(hass):
     assert len(runtime.retry_handles) == 1
     handle = next(iter(runtime.retry_handles))
 
-    holder.invalidate()
+    holder.invalidate_entry("entry-1")
 
     with pytest.raises(asyncio.CancelledError):
         await operation
@@ -251,15 +253,46 @@ async def test_unload_cancels_registered_retry_handle(hass):
 async def test_reload_uses_next_lifecycle_epoch(hass):
     holder = RuntimeHolder.for_hass(hass)
     first = holder.create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=FakeStore(), client=FakeClient([])
+        FakeEntry("entry-1", ENTRY_DATA), store=FakeStore(), client=FakeClient([])
     )
-    holder.invalidate()
+    holder.invalidate_entry("entry-1")
     second = holder.create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=FakeStore(), client=FakeClient([])
+        FakeEntry("entry-1", ENTRY_DATA), store=FakeStore(), client=FakeClient([])
     )
 
     assert first.lifecycle_epoch == 0
     assert second.lifecycle_epoch == 1
+    assert second.is_current()
+
+
+@pytest.mark.asyncio
+async def test_entry_runtime_lifecycle_isolation_and_stale_invalidation(hass):
+    holder = RuntimeHolder.for_hass(hass)
+    first_entry = FakeEntry("entry-1", ENTRY_DATA)
+    second_entry = FakeEntry(
+        "entry-2",
+        {**ENTRY_DATA, "mac": "11:22:33:44:55:66"},
+    )
+    first = holder.create_entry_runtime(
+        first_entry, store=FakeStore(), client=FakeClient([])
+    )
+    second = holder.create_entry_runtime(
+        second_entry, store=FakeStore(), client=FakeClient([])
+    )
+
+    assert first.lifecycle_epoch == 0
+    assert second.lifecycle_epoch == 0
+    assert holder.invalidate_entry(first_entry, expected_runtime=first) is True
+    assert first.stopped is True
+    assert second.is_current()
+    assert holder.lifecycle_epochs == {"entry-1": 1, "entry-2": 0}
+
+    replacement = holder.create_entry_runtime(
+        first_entry, store=FakeStore(), client=FakeClient([])
+    )
+    assert replacement.lifecycle_epoch == 1
+    assert holder.invalidate_entry(first_entry, expected_runtime=first) is False
+    assert holder.get_entry_runtime(first_entry) is replacement
     assert second.is_current()
 
 
@@ -276,7 +309,7 @@ async def test_concurrent_provision_calls_share_one_setup(hass):
     store = FakeStore()
     client = BlockingClient([])
     runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=store, client=client
+        FakeEntry("entry-1", ENTRY_DATA), store=store, client=client
     )
     first = asyncio.create_task(runtime.async_provision())
     second = asyncio.create_task(runtime.async_provision())
@@ -294,7 +327,7 @@ async def test_malformed_store_state_never_retries(hass):
     store = FakeStore({"version": 1, "mac": MAC, "unexpected": True})
     client = FakeClient([])
     runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=store, client=client
+        FakeEntry("entry-1", ENTRY_DATA), store=store, client=client
     )
 
     with pytest.raises(InvalidStoredState):
@@ -312,7 +345,7 @@ async def test_store_read_failure_never_retries(hass):
 
     client = FakeClient([])
     runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=ReadErrorStore(), client=client
+        FakeEntry("entry-1", ENTRY_DATA), store=ReadErrorStore(), client=client
     )
 
     with pytest.raises(OSError, match="store unavailable"):
@@ -329,7 +362,7 @@ async def test_store_pending_write_failure_never_retries(hass):
 
     client = FakeClient([])
     runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=WriteErrorStore(), client=client
+        FakeEntry("entry-1", ENTRY_DATA), store=WriteErrorStore(), client=client
     )
 
     with pytest.raises(OSError, match="store unavailable"):
@@ -346,7 +379,7 @@ async def test_store_complete_write_failure_never_retries(hass):
 
     client = FakeClient([SetupCredentials("api-key", "friendly-id")])
     runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=CompleteWriteErrorStore(), client=client
+        FakeEntry("entry-1", ENTRY_DATA), store=CompleteWriteErrorStore(), client=client
     )
 
     with pytest.raises(OSError, match="store unavailable"):
@@ -374,12 +407,12 @@ async def test_late_setup_completion_cannot_persist_after_unload(hass):
     client = LateClient([])
     holder = RuntimeHolder.for_hass(hass)
     runtime = holder.create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=store, client=client
+        FakeEntry("entry-1", ENTRY_DATA), store=store, client=client
     )
     operation = asyncio.create_task(runtime.async_provision())
     await started.wait()
 
-    holder.invalidate()
+    holder.invalidate_entry("entry-1")
     release.set()
 
     with pytest.raises(ProvisioningInvalidatedError):

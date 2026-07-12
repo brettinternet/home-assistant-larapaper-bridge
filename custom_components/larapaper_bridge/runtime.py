@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
+
+from homeassistant.helpers.device_registry import DeviceInfo
 
 from .client import LarapaperClient
 from .const import CONF_BASE_URL, CONF_MAC, CONF_MIN_POLL_SECONDS, DOMAIN
@@ -19,9 +21,9 @@ class RuntimeHolder:
 
     def __init__(self, hass: Any) -> None:
         self.hass = hass
-        self.lifecycle_epoch = 0
+        self.lifecycle_epochs: dict[str, int] = {}
         self.image_resources: Any | None = None
-        self.current: EntryRuntime | None = None
+        self.runtimes: dict[str, EntryRuntime] = {}
 
     @classmethod
     def for_hass(cls, hass: Any) -> RuntimeHolder:
@@ -40,9 +42,11 @@ class RuntimeHolder:
         client: LarapaperClient | None = None,
         sleep: Sleep | None = None,
     ) -> EntryRuntime:
-        """Create the current coordinator at the holder's current epoch."""
-        if self.current is not None:
-            self.invalidate()
+        """Create one coordinator at that entry's current lifecycle epoch."""
+        entry_id = self._entry_id(config_entry)
+        self.lifecycle_epochs.setdefault(entry_id, 0)
+        if entry_id in self.runtimes:
+            self.invalidate_entry(entry_id)
         runtime = EntryRuntime(
             holder=self,
             config_entry=config_entry,
@@ -55,16 +59,42 @@ class RuntimeHolder:
             ),
             sleep=sleep,
         )
-        self.current = runtime
+        self.runtimes[entry_id] = runtime
         return runtime
 
-    def invalidate(self) -> None:
-        """Fence and cancel the current entry, then advance the epoch."""
-        current = self.current
-        self.current = None
-        self.lifecycle_epoch += 1
+    def get_entry_runtime(self, entry_or_id: Any) -> EntryRuntime | None:
+        """Return only the runtime owned by the requested config entry."""
+        return self.runtimes.get(self._entry_id(entry_or_id))
+
+    def invalidate_entry(
+        self,
+        entry_or_id: Any,
+        *,
+        expected_runtime: EntryRuntime | None = None,
+    ) -> bool:
+        """Fence one entry, unless a replacement runtime owns its ID."""
+        entry_id = self._entry_id(entry_or_id)
+        current = self.runtimes.get(entry_id)
+        if expected_runtime is not None and current is not expected_runtime:
+            return False
+        self.runtimes.pop(entry_id, None)
+        self.lifecycle_epochs[entry_id] = (
+            self.lifecycle_epochs.get(entry_id, 0) + 1
+        )
         if current is not None:
             current._invalidate()
+        return True
+
+    @staticmethod
+    def _entry_id(entry_or_id: Any) -> str:
+        entry_id = (
+            entry_or_id
+            if isinstance(entry_or_id, str)
+            else getattr(entry_or_id, "entry_id", None)
+        )
+        if not isinstance(entry_id, str) or not entry_id:
+            raise ValueError("config entry ID is required")
+        return entry_id
 
 class EntryRuntime:
     """Own one entry's cancellable tasks and provisioning operation."""
@@ -80,10 +110,11 @@ class EntryRuntime:
     ) -> None:
         self.holder = holder
         self.config_entry = config_entry
+        self.entry_id = holder._entry_id(config_entry)
         self.store = store
         self.client = client
         self.mac = config_entry.data[CONF_MAC]
-        self.lifecycle_epoch = holder.lifecycle_epoch
+        self.lifecycle_epoch = holder.lifecycle_epochs.get(self.entry_id, 0)
         self._cycle_generation = 0
         self.stopped = False
         self.tasks: set[asyncio.Task[Any]] = set()
@@ -101,8 +132,17 @@ class EntryRuntime:
         self.provisioning_error: str | None = None
         self._provision_task: asyncio.Task[dict[str, Any]] | None = None
 
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return the shared Home Assistant device identity."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.mac)},
+            name=getattr(self.config_entry, "title", None) or self.mac,
+            manufacturer="Larapaper",
+        )
+
     def notify_camera_state(self) -> None:
-        """Write the cache-backed camera state on the Home Assistant loop."""
+        """Write cache-backed camera state on the Home Assistant loop."""
         if self.is_current() and self.camera_entity is not None:
             self.camera_entity.async_write_ha_state()
 
@@ -110,8 +150,9 @@ class EntryRuntime:
         """Return whether this runtime may still mutate entry state."""
         return (
             not self.stopped
-            and self.holder.current is self
-            and self.holder.lifecycle_epoch == self.lifecycle_epoch
+            and self.holder.runtimes.get(self.entry_id) is self
+            and self.holder.lifecycle_epochs.get(self.entry_id)
+            == self.lifecycle_epoch
         )
     def begin_cycle(self):
         """Advance the cycle generation and return its fencing token."""
@@ -128,7 +169,9 @@ class EntryRuntime:
             and token.cycle_generation == self._cycle_generation
         )
 
-    def create_task(self, awaitable: Awaitable[Any]) -> asyncio.Task[Any]:
+    def create_task(
+        self, awaitable: Coroutine[Any, Any, Any]
+    ) -> asyncio.Task[Any]:
         """Create and register a runtime-owned task for unload cancellation."""
         task = asyncio.create_task(awaitable)
         self.tasks.add(task)
@@ -178,7 +221,9 @@ class EntryRuntime:
         """Drop a settled retry handle from the runtime registry."""
         self.retry_handles.discard(handle)
 
-    def _create_task(self, awaitable: Awaitable[dict[str, Any]]) -> asyncio.Task[dict[str, Any]]:
+    def _create_task(
+        self, awaitable: Coroutine[Any, Any, dict[str, Any]]
+    ) -> asyncio.Task[dict[str, Any]]:
         task = asyncio.create_task(awaitable)
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)

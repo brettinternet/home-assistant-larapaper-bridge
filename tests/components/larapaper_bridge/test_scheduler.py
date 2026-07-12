@@ -27,7 +27,9 @@ ENTRY_DATA = {
 
 @dataclass
 class FakeEntry:
+    entry_id: str
     data: dict[str, object]
+    title: str = MAC
 
 
 class FakeStore:
@@ -136,10 +138,56 @@ class RetryBlockingImage:
 @pytest.fixture
 def runtime(hass):
     runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
-        FakeEntry(ENTRY_DATA), store=FakeStore(), client=FakeRuntimeClient()
+        FakeEntry("entry-1", ENTRY_DATA), store=FakeStore(), client=FakeRuntimeClient()
     )
     yield runtime
-    runtime.holder.invalidate()
+    runtime.holder.invalidate_entry("entry-1")
+
+
+@pytest.mark.asyncio
+async def test_entry_schedulers_are_isolated(hass):
+    holder = RuntimeHolder.for_hass(hass)
+    first_entry = FakeEntry("entry-1", ENTRY_DATA)
+    second_entry = FakeEntry(
+        "entry-2",
+        {**ENTRY_DATA, "mac": "11:22:33:44:55:66"},
+    )
+    first_runtime = holder.create_entry_runtime(
+        first_entry, store=FakeStore(), client=FakeRuntimeClient()
+    )
+    second_runtime = holder.create_entry_runtime(
+        second_entry, store=FakeStore(), client=FakeRuntimeClient()
+    )
+    first_clock = FakeClock()
+    second_clock = FakeClock()
+    first_display = FakeDisplay(first_clock)
+    second_display = FakeDisplay(second_clock)
+    first_scheduler = DisplayScheduler(
+        first_runtime,
+        api_key="first",
+        display_client=first_display,
+        clock=first_clock,
+    )
+    second_scheduler = DisplayScheduler(
+        second_runtime,
+        api_key="second",
+        display_client=second_display,
+        clock=second_clock,
+    )
+
+    await first_scheduler.async_run_cycle()
+
+    assert first_display.calls == [(MAC, "first")]
+    assert first_runtime.cycle_generation == 1
+    assert second_display.calls == []
+    assert second_runtime.cycle_generation == 0
+    assert second_scheduler.cache_record == CacheRecord()
+
+    holder.invalidate_entry(first_entry, expected_runtime=first_runtime)
+    assert second_runtime.is_current()
+    await second_scheduler.async_run_cycle()
+    assert second_display.calls == [("11:22:33:44:55:66", "second")]
+    holder.invalidate_entry(second_entry, expected_runtime=second_runtime)
 
 
 @pytest.mark.asyncio
@@ -302,7 +350,7 @@ async def test_unload_abandons_blocked_image_and_rejects_late_publication(runtim
 
     cycle = asyncio.create_task(scheduler.async_run_cycle())
     await image.started.wait()
-    runtime.holder.invalidate()
+    runtime.holder.invalidate_entry("entry-1")
     assert image.abandoned == [OperationToken(0, 1)]
 
     image.release.set()
@@ -405,7 +453,7 @@ async def test_late_image_success_after_unload_cannot_publish_cache(runtime):
 
     class InvalidatingImage(FakeImage):
         async def async_process(self, url: str, token: OperationToken) -> ImageOutcome:
-            self.runtime.holder.invalidate()
+            self.runtime.holder.invalidate_entry("entry-1")
             return await super().async_process(url, token)
 
         def __init__(self, runtime):
@@ -537,4 +585,4 @@ async def test_stale_notification_chunks_large_durations_and_respects_boundary(
     await asyncio.sleep(0)
     assert delays == [50.0, 86_400.0]
 
-    runtime.holder.invalidate()
+    runtime.holder.invalidate_entry("entry-1")

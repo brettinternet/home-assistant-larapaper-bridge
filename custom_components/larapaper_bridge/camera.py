@@ -22,9 +22,8 @@ class LarapaperBridgeCamera(Camera):
         """Initialize the cache-only camera projection."""
         super().__init__()
         self._runtime = runtime
-        entry = runtime.config_entry
-        entry_identity = getattr(entry, "entry_id", runtime.mac)
-        self._attr_unique_id = f"{DOMAIN}_{entry_identity}_camera"
+        self._attr_unique_id = f"{DOMAIN}_{runtime.mac}_camera"
+        self._attr_device_info = runtime.device_info
         self.content_type = "image/png"
 
     @property
@@ -55,10 +54,10 @@ async def async_setup_entry(
 ) -> None:
     """Add the camera for the already-created entry runtime."""
     holder = hass.data.get(DOMAIN)
-    if not isinstance(holder, RuntimeHolder) or holder.current is None:
+    if not isinstance(holder, RuntimeHolder):
         return
-    runtime = holder.current
-    if runtime.config_entry is not entry:
+    runtime = holder.get_entry_runtime(entry)
+    if runtime is None:
         return
     camera = LarapaperBridgeCamera(runtime)
     runtime.camera_entity = camera

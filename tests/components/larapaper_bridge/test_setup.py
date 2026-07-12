@@ -29,12 +29,15 @@ ENTRY_DATA = {
 class FakeEntry:
     entry_id: str
     data: dict[str, object]
+    title: str = MAC
 
 
 class FakeRuntime:
     def __init__(self, holder: FakeHolder, entry: FakeEntry) -> None:
         self.holder = holder
         self.config_entry = entry
+        self.entry_id = entry.entry_id
+        self.mac = entry.data["mac"]
         self.scheduler: Any | None = None
         self.provision_calls = 0
         self.invalidated = False
@@ -51,21 +54,31 @@ class FakeRuntime:
         if self.holder.provision_error is not None:
             raise self.holder.provision_error
         return {"api_key": "secret-api-key", "friendly_id": "display-1"}
+
     def create_task(self, awaitable):
         task = asyncio.create_task(awaitable)
         self.tasks.append(task)
         return task
+
+    def notify_camera_state(self) -> None:
+        return None
+
     def is_current(self) -> bool:
-        return self.holder.current is self and not self.invalidated
+        return (
+            self.holder.runtimes.get(self.entry_id) is self
+            and not self.invalidated
+        )
 
 
 class FakeHolder:
     provision_error: Exception | None = None
     provision_future: asyncio.Future[None] | None = None
     validation_error: Exception | None = None
+
     def __init__(self, hass: Any) -> None:
         self.hass = hass
-        self.current: FakeRuntime | None = None
+        self.runtimes: dict[str, FakeRuntime] = {}
+        self.lifecycle_epochs: dict[str, int] = {}
         self.invalidations = 0
 
     @classmethod
@@ -77,16 +90,31 @@ class FakeHolder:
         return holder
 
     def create_entry_runtime(self, entry: FakeEntry) -> FakeRuntime:
+        self.lifecycle_epochs.setdefault(entry.entry_id, 0)
         runtime = FakeRuntime(self, entry)
-        self.current = runtime
+        runtime.lifecycle_epoch = self.lifecycle_epochs[entry.entry_id]
+        self.runtimes[entry.entry_id] = runtime
         return runtime
-    def invalidate(self) -> None:
+
+    def get_entry_runtime(self, entry: FakeEntry) -> FakeRuntime | None:
+        return self.runtimes.get(entry.entry_id)
+
+    def invalidate_entry(
+        self, entry: FakeEntry, *, expected_runtime: FakeRuntime | None = None
+    ) -> bool:
         self.invalidations += 1
-        if self.current is not None:
-            self.current.invalidated = True
-            for task in self.current.tasks:
+        runtime = self.runtimes.get(entry.entry_id)
+        if expected_runtime is not None and runtime is not expected_runtime:
+            return False
+        self.runtimes.pop(entry.entry_id, None)
+        self.lifecycle_epochs[entry.entry_id] = (
+            self.lifecycle_epochs.get(entry.entry_id, 0) + 1
+        )
+        if runtime is not None:
+            runtime.invalidated = True
+            for task in runtime.tasks:
                 task.cancel()
-        self.current = None
+        return True
 
 
 class FakeImageOperation:
@@ -128,6 +156,23 @@ async def test_setup_provisions_starts_scheduler_and_forwards_camera(
     hass, monkeypatch, setup_fakes
 ):
     entry = FakeEntry("entry-1", ENTRY_DATA)
+
+    class FakeDevice:
+        id = "device-1"
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.updates: list[tuple[str, dict[str, object]]] = []
+
+        def async_get_device(self, *, identifiers):
+            assert identifiers == {(DOMAIN, MAC)}
+            return FakeDevice()
+
+        def async_update_device(self, device_id: str, **kwargs: object):
+            self.updates.append((device_id, kwargs))
+
+    registry = FakeRegistry()
+    monkeypatch.setattr(integration.dr, "async_get", lambda _hass: registry)
     image_calls: list[dict[str, object]] = []
     forwarded: list[tuple[object, list[object]]] = []
 
@@ -149,8 +194,14 @@ async def test_setup_provisions_starts_scheduler_and_forwards_camera(
     assert await integration.async_setup_entry(hass, entry) is True
     await asyncio.sleep(0)
 
+    assert registry.updates == [
+        (
+            "device-1",
+            {"name": "display-1", "manufacturer": "Larapaper"},
+        )
+    ]
     holder = hass.data[DOMAIN]
-    runtime = holder.current
+    runtime = holder.runtimes.get("entry-1")
     assert runtime is not None
     assert runtime.provision_calls == 1
     assert entry.title == "display-1"
@@ -201,18 +252,18 @@ async def test_unload_forwards_platform_unload_and_invalidates_runtime(
 
     await integration.async_setup_entry(hass, entry)
     holder = hass.data[DOMAIN]
-    runtime = holder.current
+    runtime = holder.runtimes.get("entry-1")
     assert runtime is not None
     await asyncio.sleep(0)
     assert isinstance(holder, setup_fakes)
-    assert holder.current.config_entry is entry
+    assert holder.runtimes.get("entry-1").config_entry is entry
 
     assert await integration.async_unload_entry(hass, entry) is True
 
     assert runtime.config_entry is entry
     assert unloaded[0][0] is entry
     assert [platform.value for platform in unloaded[0][1]] == ["camera"]
-    assert holder.current is None
+    assert holder.runtimes == {}
     assert runtime.invalidated is True
     assert holder.invalidations == 1
 
@@ -242,13 +293,13 @@ async def test_unload_invalidates_runtime_when_platform_unload_fails(
 
     await integration.async_setup_entry(hass, entry)
     holder = hass.data[DOMAIN]
-    runtime = holder.current
+    runtime = holder.runtimes.get("entry-1")
     assert runtime is not None
 
     with pytest.raises(RuntimeError, match="platform unload failed"):
         await integration.async_unload_entry(hass, entry)
 
-    assert holder.current is None
+    assert holder.runtimes == {}
     assert runtime.invalidated is True
 
 
@@ -280,7 +331,7 @@ async def test_setup_returns_while_provisioning_is_deferred_and_unload_cancels(
     await asyncio.sleep(0)
 
     holder = hass.data[DOMAIN]
-    runtime = holder.current
+    runtime = holder.runtimes.get("entry-1")
     assert runtime is not None
     assert runtime.provision_calls == 1
     assert runtime.tasks and not runtime.tasks[0].done()
@@ -289,7 +340,7 @@ async def test_setup_returns_while_provisioning_is_deferred_and_unload_cancels(
     await asyncio.sleep(0)
 
     assert runtime.tasks[0].cancelled()
-    assert holder.current is None
+    assert holder.runtimes == {}
 
 
 @pytest.mark.asyncio
@@ -363,7 +414,7 @@ async def test_invalid_persisted_state_raises_config_entry_error(
         await integration.async_setup_entry(hass, entry)
 
     holder = hass.data[DOMAIN]
-    assert holder.current is None
+    assert holder.runtimes == {}
     assert holder.invalidations == 1
     assert forwarded is False
 

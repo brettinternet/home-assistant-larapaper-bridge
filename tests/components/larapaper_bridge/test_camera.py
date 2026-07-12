@@ -11,6 +11,7 @@ from custom_components.larapaper_bridge.camera import (
     LarapaperBridgeCamera,
     async_setup_entry,
 )
+from custom_components.larapaper_bridge.const import DOMAIN
 from custom_components.larapaper_bridge.runtime import RuntimeHolder
 from custom_components.larapaper_bridge.scheduler import CacheRecord, DisplayScheduler
 
@@ -27,7 +28,7 @@ ENTRY_DATA = {
 class FakeEntry:
     entry_id: str
     data: dict[str, object]
-
+    title: str = MAC
 
 class FakeStore:
     async def async_load(self):
@@ -53,7 +54,7 @@ class FakeClock:
 @pytest.fixture
 def camera_runtime(hass):
     runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
-        FakeEntry("entry-1", ENTRY_DATA),
+        FakeEntry("entry-1", ENTRY_DATA, "friendly-id"),
         store=FakeStore(),
         client=FakeClient(),
     )
@@ -65,7 +66,7 @@ def camera_runtime(hass):
         utc_now=lambda: datetime(2026, 7, 11, tzinfo=timezone.utc),
     )
     yield runtime, scheduler, clock
-    runtime.holder.invalidate()
+    runtime.holder.invalidate_entry("entry-1")
 
 
 @pytest.mark.asyncio
@@ -76,6 +77,19 @@ async def test_camera_is_cold_and_unavailable_without_scheduler_image(camera_run
     assert camera.available is False
     assert camera.content_type == "image/png"
     assert await camera.async_camera_image() is None
+
+
+@pytest.mark.asyncio
+async def test_camera_uses_mac_identity_and_shared_device_info(camera_runtime):
+    runtime, _scheduler, _clock = camera_runtime
+    camera = LarapaperBridgeCamera(runtime)
+
+    assert camera.unique_id == f"{DOMAIN}_{MAC}_camera"
+    assert camera.device_info == {
+        "identifiers": {(DOMAIN, MAC)},
+        "name": "friendly-id",
+        "manufacturer": "Larapaper",
+    }
 
 
 @pytest.mark.asyncio
