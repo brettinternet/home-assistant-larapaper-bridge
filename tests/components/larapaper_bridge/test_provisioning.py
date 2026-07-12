@@ -126,7 +126,7 @@ async def test_retries_with_fixed_backoff_and_observes_complete_state(hass):
     store = FakeStore()
     client = FakeClient(
         [
-            LarapaperClientError("setup_failed", "safe"),
+            LarapaperClientError("setup_auto_assign_disabled", "safe"),
             SetupCredentials("api-key", "friendly-id"),
         ]
     )
@@ -138,6 +138,7 @@ async def test_retries_with_fixed_backoff_and_observes_complete_state(hass):
     for _ in range(3):
         await asyncio.sleep(0)
     assert sleep.delays == [RETRY_DELAYS_SECONDS[0]]
+    assert runtime.provisioning_error == "setup_auto_assign_disabled"
     sleep.release.set()
 
     assert await operation == store.state
@@ -146,6 +147,30 @@ async def test_retries_with_fixed_backoff_and_observes_complete_state(hass):
         ("pending", MAC),
         ("complete", MAC, "api-key", "friendly-id"),
     ]
+    assert runtime.provisioning_error is None
+
+
+@pytest.mark.asyncio
+async def test_generic_provisioning_failure_is_reported_and_cleared_after_retry(hass):
+    store = FakeStore()
+    client = FakeClient(
+        [
+            RuntimeError("temporary setup failure"),
+            SetupCredentials("api-key", "friendly-id"),
+        ]
+    )
+    sleep = FakeSleep()
+    runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
+        FakeEntry(ENTRY_DATA), store=store, client=client, sleep=sleep
+    )
+    operation = asyncio.create_task(runtime.async_provision())
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert runtime.provisioning_error == "setup_failed"
+    sleep.release.set()
+    assert await operation == store.state
+    assert runtime.provisioning_error is None
 
 
 @pytest.mark.asyncio

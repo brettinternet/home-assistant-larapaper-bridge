@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .client import LarapaperClient
+from .client import LarapaperClient, LarapaperClientError
 from .storage import InvalidStoredState, LarapaperStore, validate_identity_payload
 
 RETRY_DELAYS_SECONDS = (5.0, 10.0, 20.0, 40.0, 60.0)
@@ -22,6 +22,7 @@ class ProvisioningInvalidatedError(RuntimeError):
 
 Sleep = Callable[[float], Awaitable[None]]
 IsActive = Callable[[], bool]
+ReportError = Callable[[str | None], None]
 RegisterRetryHandle = Callable[[asyncio.TimerHandle], None]
 UnregisterRetryHandle = Callable[[asyncio.TimerHandle], None]
 
@@ -35,14 +36,22 @@ class Provisioner:
         store: LarapaperStore,
         client: LarapaperClient,
         sleep: Sleep | None = None,
+        report_error: ReportError | None = None,
         register_retry_handle: RegisterRetryHandle | None = None,
         unregister_retry_handle: UnregisterRetryHandle | None = None,
     ) -> None:
         self._store = store
         self._client = client
         self._sleep = sleep
+        self._report_error = report_error
         self._register_retry_handle = register_retry_handle
         self._unregister_retry_handle = unregister_retry_handle
+
+    async def async_validate_stored_state(
+        self, mac: str, is_active: IsActive
+    ) -> None:
+        """Validate persisted identity state without starting provisioning."""
+        await self._load_state(mac, is_active)
 
     async def async_provision(self, mac: str, is_active: IsActive) -> dict[str, Any]:
         """Load, provision, and persist one identity until success or invalidation."""
@@ -61,7 +70,14 @@ class Provisioner:
                 credentials = await self._client.async_setup(mac)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as error:
+                if self._report_error is not None:
+                    code = (
+                        error.code
+                        if isinstance(error, LarapaperClientError)
+                        else "setup_failed"
+                    )
+                    self._report_error(code)
                 delay = RETRY_DELAYS_SECONDS[
                     min(retry_index, len(RETRY_DELAYS_SECONDS) - 1)
                 ]
@@ -69,6 +85,8 @@ class Provisioner:
                 await self._wait_retry(delay)
                 state = await self._load_state(mac, is_active)
                 if state is not None and "api_key" in state:
+                    if self._report_error is not None:
+                        self._report_error(None)
                     return state
                 if state is None:
                     await self._ensure_active(is_active)
@@ -85,6 +103,8 @@ class Provisioner:
             await self._store.async_save_complete(
                 complete["mac"], complete["api_key"], complete["friendly_id"]
             )
+            if self._report_error is not None:
+                self._report_error(None)
             return validate_identity_payload(complete)
 
     async def _wait_retry(self, delay: float) -> None:

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
-from aiohttp import ClientSession, ClientTimeout, TCPConnector
+from aiohttp import ClientSession, ClientTimeout, DummyCookieJar, TCPConnector
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.client_exceptions import ClientConnectorError
 from aiohttp.resolver import DefaultResolver
@@ -793,7 +793,11 @@ class ImageResources:
     ) -> ImageResources:
         """Create the one domain-scoped session and executor."""
         connector = create_image_connector(policy)
-        session = ClientSession(connector=connector, raise_for_status=False)
+        session = ClientSession(
+            connector=connector,
+            cookie_jar=DummyCookieJar(),
+            raise_for_status=False,
+        )
         return cls(
             hass,
             session=session,
@@ -878,7 +882,11 @@ async def async_get_image_resources(
 
     if session is None:
         connector = create_image_connector(policy)
-        session = ClientSession(connector=connector, raise_for_status=False)
+        session = ClientSession(
+            connector=connector,
+            cookie_jar=DummyCookieJar(),
+            raise_for_status=False,
+        )
     if executor is None:
         executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="larapaper-image"

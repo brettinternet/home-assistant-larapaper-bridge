@@ -7,9 +7,11 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
+from homeassistant.config_entries import ConfigEntryError
 
 import custom_components.larapaper_bridge as integration
 from custom_components.larapaper_bridge.const import DOMAIN
+from custom_components.larapaper_bridge.storage import InvalidStoredState
 
 
 MAC = "AA:BB:CC:DD:EE:FF"
@@ -38,6 +40,10 @@ class FakeRuntime:
         self.invalidated = False
         self.tasks: list[asyncio.Task[Any]] = []
 
+    async def async_validate_persisted_state(self) -> None:
+        if self.holder.validation_error is not None:
+            raise self.holder.validation_error
+
     async def async_provision(self) -> dict[str, str]:
         self.provision_calls += 1
         if self.holder.provision_future is not None:
@@ -45,7 +51,6 @@ class FakeRuntime:
         if self.holder.provision_error is not None:
             raise self.holder.provision_error
         return {"api_key": "secret-api-key", "friendly_id": "display-1"}
-
     def create_task(self, awaitable):
         task = asyncio.create_task(awaitable)
         self.tasks.append(task)
@@ -57,7 +62,7 @@ class FakeRuntime:
 class FakeHolder:
     provision_error: Exception | None = None
     provision_future: asyncio.Future[None] | None = None
-
+    validation_error: Exception | None = None
     def __init__(self, hass: Any) -> None:
         self.hass = hass
         self.current: FakeRuntime | None = None
@@ -108,6 +113,7 @@ def setup_fakes(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(integration, "DisplayScheduler", FakeScheduler)
     FakeHolder.provision_error = None
     FakeHolder.provision_future = None
+    FakeHolder.validation_error = None
     FakeScheduler.instances.clear()
     return FakeHolder
 
@@ -329,3 +335,29 @@ async def test_image_resource_failure_does_not_start_display_scheduler(
     scheduler = FakeScheduler.instances[-1]
     assert scheduler.last_error == "setup_failed"
     assert scheduler.started is False
+
+@pytest.mark.asyncio
+async def test_invalid_persisted_state_raises_config_entry_error(
+    hass, monkeypatch, setup_fakes
+):
+    entry = FakeEntry("entry-1", ENTRY_DATA)
+    setup_fakes.validation_error = InvalidStoredState("invalid stored state")
+    forwarded = False
+
+    async def forward_entry_setups(_entry, _platforms):
+        nonlocal forwarded
+        forwarded = True
+
+    monkeypatch.setattr(
+        hass.config_entries,
+        "async_forward_entry_setups",
+        forward_entry_setups,
+    )
+
+    with pytest.raises(ConfigEntryError, match="invalid persisted Larapaper identity"):
+        await integration.async_setup_entry(hass, entry)
+
+    holder = hass.data[DOMAIN]
+    assert holder.current is None
+    assert holder.invalidations == 1
+    assert forwarded is False

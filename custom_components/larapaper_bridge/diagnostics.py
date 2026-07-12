@@ -29,9 +29,12 @@ def _serialize_datetime(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
-def _empty_state() -> DiagnosticsState:
-    """Return the cold-start diagnostics projection."""
-    return DiagnosticsState()
+def _empty_state(last_error: str | None = None) -> DiagnosticsState:
+    """Return the cold-start or provisioning-error projection."""
+    return DiagnosticsState(
+        status="error" if last_error is not None else "starting",
+        last_error=last_error,
+    )
 
 
 def _diagnostics_dict(state: DiagnosticsState) -> dict[str, Any]:
@@ -60,12 +63,11 @@ async def async_get_config_entry_diagnostics(
     state = _empty_state()
     if isinstance(holder, RuntimeHolder):
         runtime = holder.current
-        if (
-            runtime is not None
-            and runtime.config_entry is entry
-            and runtime.scheduler is not None
-        ):
-            state = runtime.scheduler.diagnostics_state()
+        if runtime is not None and runtime.config_entry is entry:
+            if runtime.scheduler is not None:
+                state = runtime.scheduler.diagnostics_state()
+            else:
+                state = _empty_state(getattr(runtime, "provisioning_error", None))
     result = _diagnostics_dict(state)
     assert tuple(result) == _DIAGNOSTIC_KEYS
     return result

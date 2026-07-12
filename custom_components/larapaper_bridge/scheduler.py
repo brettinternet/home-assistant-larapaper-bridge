@@ -124,6 +124,8 @@ Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[None]]
 
 
+_STALE_NOTIFICATION_CHUNK_SECONDS = 24 * 60 * 60
+
 class DisplayScheduler:
     """Run one display call per cycle using settlement-anchored deadlines."""
 
@@ -328,9 +330,14 @@ class DisplayScheduler:
         """Notify the camera when this cache record reaches its stale boundary."""
         if self._stale_task is not None:
             self._stale_task.cancel()
-        delay = max(
-            0.0,
-            received_monotonic + self.max_stale_seconds - self.clock(),
+        age = max(0.0, self.clock() - received_monotonic)
+        try:
+            remaining = float(self.max_stale_seconds) - age
+        except OverflowError:
+            remaining = float("inf")
+        delay = min(
+            float(_STALE_NOTIFICATION_CHUNK_SECONDS),
+            max(0.0, remaining),
         )
         self._stale_task = self.runtime.create_task(
             self._wait_for_stale_boundary(received_monotonic, delay)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryError
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
@@ -16,8 +16,9 @@ from .const import (
 )
 from .image import async_create_image_operation
 from .runtime import EntryRuntime, RuntimeHolder
+from .provisioning import ProvisioningStateError
 from .scheduler import DisplayScheduler
-
+from .storage import InvalidStoredState
 PLATFORMS = [Platform.CAMERA]
 
 
@@ -59,6 +60,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up the camera and own provisioning/scheduler background work."""
     holder = RuntimeHolder.for_hass(hass)
     runtime = holder.create_entry_runtime(entry)
+    try:
+        await runtime.async_validate_persisted_state()
+    except (InvalidStoredState, ProvisioningStateError) as error:
+        if holder.current is runtime:
+            holder.invalidate()
+        raise ConfigEntryError("invalid persisted Larapaper identity") from error
     try:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     except Exception:

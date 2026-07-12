@@ -507,3 +507,34 @@ def test_image_outcome_and_projection_types_are_immutable():
         ImageOutcome()
     with pytest.raises(ValueError):
         ImageOutcome(error_code="fetch")
+@pytest.mark.asyncio
+async def test_stale_notification_chunks_large_durations_and_respects_boundary(
+    runtime,
+):
+    clock = FakeClock(99_950.0)
+    delays: list[float] = []
+    release = asyncio.Event()
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+        await release.wait()
+
+    scheduler = DisplayScheduler(
+        runtime,
+        api_key="secret",
+        display_client=FakeDisplay(clock),
+        image_operation=FakeImage(clock),
+        clock=clock,
+        sleep=sleep,
+    )
+    scheduler.max_stale_seconds = 100_000
+    scheduler._schedule_stale_notification(0.0)
+    await asyncio.sleep(0)
+    assert delays == [50.0]
+
+    scheduler.max_stale_seconds = 10**309
+    scheduler._schedule_stale_notification(99_950.0)
+    await asyncio.sleep(0)
+    assert delays == [50.0, 86_400.0]
+
+    runtime.holder.invalidate()

@@ -94,9 +94,11 @@ class EntryRuntime:
             store=store,
             client=client,
             sleep=sleep,
+            report_error=self._set_provisioning_error,
             register_retry_handle=self.register_retry_handle,
             unregister_retry_handle=self.unregister_retry_handle,
         )
+        self.provisioning_error: str | None = None
         self._provision_task: asyncio.Task[dict[str, Any]] | None = None
 
     def notify_camera_state(self) -> None:
@@ -137,6 +139,17 @@ class EntryRuntime:
     def cycle_generation(self) -> int:
         """Return the current display-cycle generation."""
         return self._cycle_generation
+
+    async def async_validate_persisted_state(self) -> None:
+        """Validate persisted identity before forwarding platform setup."""
+        await self._provisioner.async_validate_stored_state(
+            self.mac, self.is_current
+        )
+
+    def _set_provisioning_error(self, error_code: str | None) -> None:
+        """Expose a safe provisioning error while retries remain active."""
+        if self.is_current():
+            self.provisioning_error = error_code
 
     async def async_provision(self) -> dict[str, Any]:
         """Provision once; concurrent callers share the same operation."""

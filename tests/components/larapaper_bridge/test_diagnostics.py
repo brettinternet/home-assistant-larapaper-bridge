@@ -174,3 +174,20 @@ async def test_diagnostics_reports_error_without_serveable_cache(diagnostics_run
     assert first["ready"] is False
     assert first["stale"] is False
     assert first["last_error"] == "image_fetch_failed"
+
+@pytest.mark.asyncio
+async def test_diagnostics_reports_provisioning_error_before_scheduler_exists(hass):
+    entry = FakeEntry("entry-1", ENTRY_DATA)
+    runtime = RuntimeHolder.for_hass(hass).create_entry_runtime(
+        entry,
+        store=FakeStore(),
+        client=FakeClient(),
+    )
+    runtime.provisioning_error = "setup_auto_assign_disabled"
+
+    result = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert result["status"] == "error"
+    assert result["ready"] is False
+    assert result["last_error"] == "setup_auto_assign_disabled"
+    runtime.holder.invalidate()

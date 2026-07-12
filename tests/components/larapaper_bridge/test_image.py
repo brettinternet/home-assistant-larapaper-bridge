@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from aiohttp import DummyCookieJar
+
 import asyncio
 import socket
 import random
@@ -1004,3 +1006,38 @@ async def test_image_operation_keeps_all_prior_generations_abandoned(
     assert conversions == 0
     assert resources._conversion_future is None
     await resources._async_stop(None)
+
+@pytest.mark.asyncio
+async def test_created_image_sessions_disable_cookie_storage(monkeypatch):
+    from custom_components.larapaper_bridge import image as image_module
+
+    class FakeBus:
+        def async_listen_once(self, _event: str, _callback: object) -> None:
+            return None
+
+    class FakeHass:
+
+        data: dict[str, object] = {}
+        bus = FakeBus()
+
+    sessions: list[dict[str, object]] = []
+
+    def session_factory(**kwargs: object) -> FakeImageSession:
+        sessions.append(kwargs)
+        return FakeImageSession([])
+
+    monkeypatch.setattr(image_module, "ClientSession", session_factory)
+    monkeypatch.setattr(
+        image_module, "create_image_connector", lambda _policy: object()
+    )
+    policy = ImageNetworkPolicy.from_urls(BASE)
+
+    resources = await ImageResources.async_create(FakeHass(), policy)
+    resources_from_factory = await async_get_image_resources(
+        FakeHass(), larapaper_base_url=BASE
+    )
+
+    assert len(sessions) == 2
+    assert all(isinstance(item["cookie_jar"], DummyCookieJar) for item in sessions)
+    await resources._async_stop(None)
+    await resources_from_factory._async_stop(None)
