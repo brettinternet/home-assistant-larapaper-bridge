@@ -586,3 +586,150 @@ async def test_stale_notification_chunks_large_durations_and_respects_boundary(
     assert delays == [50.0, 86_400.0]
 
     runtime.holder.invalidate_entry("entry-1")
+
+
+class GateSleep:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.calls: list[float] = []
+        self.release = asyncio.Event()
+
+    async def __call__(self, delay: float) -> None:
+        self.calls.append(delay)
+        self.started.set()
+        await self.release.wait()
+
+
+class BlockingDisplay:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+        self.active = 0
+        self.max_active = 0
+
+    async def async_display(self, _mac: str, _api_key: str) -> DisplayResult:
+        self.calls += 1
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        self.started.set()
+        try:
+            await self.release.wait()
+            return DisplayResult("/image.png", 60.0)
+        finally:
+            self.active -= 1
+
+
+@pytest.mark.asyncio
+async def test_manual_refresh_wakes_automatic_wait_and_resets_deadline(runtime):
+    clock = FakeClock()
+    display = FakeDisplay(clock)
+    sleep = GateSleep()
+    scheduler = DisplayScheduler(
+        runtime,
+        api_key="secret",
+        display_client=display,
+        clock=clock,
+        sleep=sleep,
+    )
+    task = scheduler.async_start()
+    await sleep.started.wait()
+    assert display.calls == [(MAC, "secret")]
+    assert scheduler.next_display_deadline == 160.0
+
+    clock.value = 123.0
+    await scheduler.async_request_refresh()
+    for _ in range(8):
+        await asyncio.sleep(0)
+        if len(display.calls) == 2:
+            break
+    assert len(display.calls) == 2
+    assert runtime.cycle_generation == 2
+    assert scheduler.next_display_deadline == 183.0
+
+    scheduler.stop()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_manual_refresh_coalesces_with_active_display(runtime):
+    display = BlockingDisplay()
+    scheduler = DisplayScheduler(runtime, api_key="secret", display_client=display)
+    task = scheduler.async_start()
+    await display.started.wait()
+
+    await asyncio.gather(
+        scheduler.async_request_refresh(),
+        scheduler.async_request_refresh(),
+    )
+    assert display.calls == 1
+    assert display.max_active == 1
+
+    display.release.set()
+    await asyncio.sleep(0)
+    scheduler.stop()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_manual_timeout_uses_display_failure_settlement(runtime):
+    clock = FakeClock()
+    display = FakeDisplay(clock)
+    sleep = GateSleep()
+    scheduler = DisplayScheduler(
+        runtime,
+        api_key="secret",
+        display_client=display,
+        clock=clock,
+        sleep=sleep,
+    )
+    task = scheduler.async_start()
+    await sleep.started.wait()
+
+    display.failure = TimeoutError()
+    clock.value = 125.0
+    await scheduler.async_request_refresh()
+    for _ in range(8):
+        await asyncio.sleep(0)
+        if len(display.calls) == 2:
+            break
+    assert len(display.calls) == 2
+    assert scheduler.last_error == "display_failed"
+    
+    scheduler.stop()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_manual_refresh_abandons_prior_image_before_new_cycle(runtime):
+    clock = FakeClock()
+    display = FakeDisplay(clock)
+    image = BlockingImage()
+    sleep = GateSleep()
+    scheduler = DisplayScheduler(
+        runtime,
+        api_key="secret",
+        display_client=display,
+        image_operation=image,
+        clock=clock,
+        sleep=sleep,
+    )
+    task = scheduler.async_start()
+    await image.started.wait()
+    await sleep.started.wait()
+
+    await scheduler.async_request_refresh()
+    for _ in range(8):
+        await asyncio.sleep(0)
+        if len(display.calls) == 2:
+            break
+    assert len(display.calls) == 2
+    assert image.abandoned == [OperationToken(0, 1)]
+    assert runtime.cycle_generation == 2
+
+    scheduler.stop()
+    with pytest.raises(asyncio.CancelledError):
+        await task

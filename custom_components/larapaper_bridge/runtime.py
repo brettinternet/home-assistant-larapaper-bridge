@@ -121,6 +121,7 @@ class EntryRuntime:
         self.retry_handles: set[asyncio.TimerHandle] = set()
         self.scheduler: Any | None = None
         self.camera_entity: Any | None = None
+        self.button_entity: Any | None = None
         self._provisioner = Provisioner(
             store=store,
             client=client,
@@ -142,10 +143,12 @@ class EntryRuntime:
         )
 
     def notify_camera_state(self) -> None:
-        """Write cache-backed camera state on the Home Assistant loop."""
-        if self.is_current() and self.camera_entity is not None:
-            self.camera_entity.async_write_ha_state()
-
+        """Write cache-backed entity state on the Home Assistant loop."""
+        if not self.is_current():
+            return
+        for entity in (self.camera_entity, self.button_entity):
+            if entity is not None:
+                entity.async_write_ha_state()
     def is_current(self) -> bool:
         """Return whether this runtime may still mutate entry state."""
         return (

@@ -76,9 +76,11 @@ class ImageOperation(Protocol):
 
     async def async_process(self, url: str, token: OperationToken) -> ImageOutcome:
         """Fetch, validate, and convert one image."""
+        ...
 
     def abandon(self, token: OperationToken) -> None:
         """Abandon work without waiting for a worker to finish."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +120,7 @@ class DisplayClient(Protocol):
 
     async def async_display(self, mac: str, api_key: str) -> DisplayResult:
         """Run one Larapaper display cycle."""
+        ...
 
 
 Clock = Callable[[], float]
@@ -168,46 +171,63 @@ class DisplayScheduler:
         self._retry_url: str | None = None
         self._retry_attempt = 0
         self._stale_task: asyncio.Task[None] | None = None
+        self._display_active = False
+        self._wake_event: asyncio.Event | None = None
+        self._manual_requested = False
+
         runtime.scheduler = self
 
     async def async_run_cycle(
         self, *, wait_for_image: bool = True
     ) -> DisplayResult | None:
         """Run one display request and settle its next deadline."""
-        token = self._begin_cycle()
+        if self._display_active:
+            return None
+        self._display_active = True
         try:
-            result = await self.display_client.async_display(
-                self.runtime.mac, self.api_key
-            )
-        except asyncio.CancelledError:
-            raise
-        except LarapaperClientError as error:
+            token = self._begin_cycle()
+            try:
+                result = await self.display_client.async_display(
+                    self.runtime.mac, self.api_key
+                )
+            except asyncio.CancelledError:
+                raise
+            except LarapaperClientError as error:
+                settled_at = self.clock()
+                if not self.runtime.is_token_current(token):
+                    return None
+                self.last_error = _safe_error_code(error.code)
+                self.next_display_deadline = settled_at + self._last_effective_interval
+                return None
+            except TimeoutError:
+                settled_at = self.clock()
+                if not self.runtime.is_token_current(token):
+                    return None
+                self.last_error = "display_failed"
+                self.next_display_deadline = settled_at + self._last_effective_interval
+                return None
+
             settled_at = self.clock()
             if not self.runtime.is_token_current(token):
                 return None
-            self.last_error = _safe_error_code(error.code)
+            self.last_display_result = result
+            self._last_effective_interval = result.effective_interval_seconds
             self.next_display_deadline = settled_at + self._last_effective_interval
-            return None
 
-        settled_at = self.clock()
-        if not self.runtime.is_token_current(token):
-            return None
-        self.last_display_result = result
-        self._last_effective_interval = result.effective_interval_seconds
-        self.next_display_deadline = settled_at + self._last_effective_interval
-
-        if result.image_url is None:
-            self.last_error = "image_url_missing"
-        elif self.image_operation is not None:
-            if wait_for_image:
-                self._image_token = token
-                await self._process_image(result.image_url, token)
-            else:
-                self._image_token = token
-                self._image_task = self.runtime.create_task(
-                    self._process_image(result.image_url, token)
-                )
-        return result
+            if result.image_url is None:
+                self.last_error = "image_url_missing"
+            elif self.image_operation is not None:
+                if wait_for_image:
+                    self._image_token = token
+                    await self._process_image(result.image_url, token)
+                else:
+                    self._image_token = token
+                    self._image_task = self.runtime.create_task(
+                        self._process_image(result.image_url, token)
+                    )
+            return result
+        finally:
+            self._display_active = False
 
     def _begin_cycle(self) -> OperationToken:
         """Advance generation before abandoning all prior cycle work."""
@@ -424,22 +444,82 @@ class DisplayScheduler:
             next_retry_at=next_retry_at,
         )
 
+    @property
+    def is_running(self) -> bool:
+        """Return whether the scheduler loop can accept a refresh request."""
+        return (
+            self.runtime.is_current()
+            and self._task is not None
+            and not self._task.done()
+        )
+
+    def _ensure_wake_event(self) -> asyncio.Event:
+        if self._wake_event is None:
+            self._wake_event = asyncio.Event()
+        return self._wake_event
+
+    async def async_request_refresh(self) -> None:
+        """Request one immediate display cycle, coalescing active work."""
+        if not self.is_running or self._display_active:
+            return
+        self._manual_requested = True
+        self.next_display_deadline = None
+        self._ensure_wake_event().set()
+
+    async def _run_sleep(self, delay: float) -> None:
+        await self.sleep(max(0.0, delay))
+
+    async def _wait_for_deadline(self, delay: float) -> None:
+        """Wait for either the automatic deadline or a manual refresh."""
+        event = self._ensure_wake_event()
+        sleep_task = asyncio.create_task(self._run_sleep(delay))
+        wake_task = asyncio.create_task(event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {sleep_task, wake_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (sleep_task, wake_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(sleep_task, wake_task, return_exceptions=True)
+        if sleep_task in done:
+            await sleep_task
+
     def async_start(self) -> asyncio.Task[None]:
         """Start the loop; its first display call is scheduled immediately."""
         if self._task is not None and not self._task.done():
             return self._task
+        self._wake_event = asyncio.Event()
+        self._manual_requested = False
         self._task = self.runtime.create_task(self._run())
         return self._task
 
     async def _run(self) -> None:
         while self.runtime.is_current():
+            if self._manual_requested:
+                self._manual_requested = False
             await self.async_run_cycle(wait_for_image=False)
-            if not self.runtime.is_current() or self.next_display_deadline is None:
+            if not self.runtime.is_current():
                 return
-            await self.sleep(max(0.0, self.next_display_deadline - self.clock()))
+            if self._manual_requested:
+                continue
+            if self.next_display_deadline is None:
+                return
+            event = self._ensure_wake_event()
+            event.clear()
+            if self._manual_requested:
+                continue
+            await self._wait_for_deadline(
+                self.next_display_deadline - self.clock()
+            )
 
     def stop(self) -> None:
         """Cancel the scheduler loop and abandon image work without waiting."""
+        self._manual_requested = False
+        if self._wake_event is not None:
+            self._wake_event.set()
         self._abandon_current_work()
         if self._stale_task is not None:
             self._stale_task.cancel()

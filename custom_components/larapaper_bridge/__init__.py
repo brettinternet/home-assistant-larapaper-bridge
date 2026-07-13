@@ -23,7 +23,7 @@ from .runtime import EntryRuntime, RuntimeHolder
 from .provisioning import ProvisioningStateError
 from .scheduler import DisplayScheduler
 from .storage import InvalidStoredState, LarapaperStore, canonicalize_mac
-PLATFORMS = [Platform.CAMERA]
+PLATFORMS = [Platform.CAMERA, Platform.BUTTON]
 
 
 async def _async_initialize_entry(hass: HomeAssistant, runtime: EntryRuntime) -> None:

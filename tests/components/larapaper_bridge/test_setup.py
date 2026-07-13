@@ -218,7 +218,7 @@ async def test_setup_provisions_starts_scheduler_and_forwards_camera(
     ]
     assert len(forwarded) == 1
     assert forwarded[0][0] is entry
-    assert [platform.value for platform in forwarded[0][1]] == ["camera"]
+    assert [platform.value for platform in forwarded[0][1]] == ["camera", "button"]
 
 
 @pytest.mark.asyncio
@@ -272,7 +272,7 @@ async def test_unload_forwards_platform_unload_and_invalidates_runtime(
 
     assert runtime.config_entry is entry
     assert unloaded[0][0] is entry
-    assert [platform.value for platform in unloaded[0][1]] == ["camera"]
+    assert [platform.value for platform in unloaded[0][1]] == ["camera", "button"]
     assert holder.runtimes == {}
     assert runtime.invalidated is True
     assert holder.invalidations == 1

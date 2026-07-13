@@ -1,6 +1,6 @@
 # Larapaper Bridge
 
-Larapaper Bridge is a Home Assistant custom integration for a self-hosted Larapaper display. It provisions one synthetic device, polls its display on the configured cadence, and exposes the latest safe image as a native Home Assistant camera.
+Larapaper Bridge is a Home Assistant custom integration for self-hosted Larapaper displays. Each config entry provisions one synthetic device, polls its display on the configured cadence, and exposes the latest safe image as a native Home Assistant camera.
 
 ## Requirements
 
@@ -38,7 +38,7 @@ After provisioning, assign the device's model and playlist in the Larapaper admi
 
 ## Camera cards
 
-The integration creates one native camera entity. Add it to a dashboard with **Picture Entity**, **Picture Glance**, or another built-in camera card. Use the entity picker to select the Larapaper camera; entity IDs can vary with Home Assistant's naming rules.
+The integration creates one native camera entity per config entry. Add it to a dashboard with **Picture Entity**, **Picture Glance**, or another built-in camera card. Use the entity picker to select the Larapaper camera; entity IDs can vary with Home Assistant's naming rules.
 
 Example:
 
@@ -51,6 +51,12 @@ show_state: false
 ```
 
 Camera reads are cache-only projections. `async_camera_image()` never calls Larapaper, fetches an image, starts a retry, advances the playlist, or mutates scheduler state. Repeated dashboard and camera-proxy refreshes therefore do not create additional `/api/display` calls or image-host requests.
+
+## Multiple devices and manual refresh
+
+Add one config entry for each Larapaper device. Each entry owns its identity, credentials, scheduler, cache, camera, diagnostics, and **Refresh display** button. Removing an entry removes only that device's integration state; the other entries continue using their own cameras and schedules.
+
+The **Refresh display** button is available after the entry finishes provisioning and its scheduler is running, including while the camera cache is cold, stale, or in an error state. A press starts one immediate display cycle when none is active. Presses during an active cycle coalesce instead of starting another `/api/display` call. Manual cycles use the normal display settlement, image-retry, and failure rules. A manual refresh advances only the selected device's Larapaper playlist.
 
 ## Diagnostics and status
 
