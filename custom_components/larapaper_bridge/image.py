@@ -15,11 +15,11 @@ import threading
 import warnings
 import zlib
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 from urllib.parse import SplitResult, unquote, urljoin, urlsplit, urlunsplit
 
 from aiohttp import ClientSession, ClientTimeout, DummyCookieJar, TCPConnector
@@ -322,7 +322,11 @@ async def _read_limited_body(response: Any, limit: int) -> bytes:
     iter_chunked = getattr(content, "iter_chunked", None)
     if callable(iter_chunked):
         body = bytearray()
-        async for chunk in iter_chunked(MAX_BODY_CHUNK_BYTES):
+        chunks = cast(
+            AsyncIterator[bytes | bytearray | memoryview],
+            iter_chunked(MAX_BODY_CHUNK_BYTES),
+        )
+        async for chunk in chunks:
             if not isinstance(chunk, (bytes, bytearray, memoryview)):
                 raise ImageTransportError("image response body was invalid")
             if len(body) + len(chunk) > limit:
@@ -489,6 +493,7 @@ def convert_image_to_png(body: bytes, *, max_image_bytes: int) -> bytes:
             with warnings.catch_warnings():
                 warnings.simplefilter("error", Image.DecompressionBombWarning)
                 try:
+                    converted: Image.Image | None = None
                     with Image.open(io.BytesIO(body)) as decoded:
                         if decoded.format != "BMP":
                             raise ImageValidationError("image format was not BMP")
@@ -518,7 +523,7 @@ def convert_image_to_png(body: bytes, *, max_image_bytes: int) -> bytes:
                                 "BMP conversion failed"
                             ) from error
                         finally:
-                            if "converted" in locals():
+                            if converted is not None:
                                 converted.close()
                         png_bytes = output.getvalue()
                 except ImageValidationError:
@@ -768,15 +773,15 @@ class PolicyConnector(TCPConnector):
             _REQUEST_ORIGIN.reset(token)
 
     async def _resolve_host(
-        self, host: str, port: int, traces: list[Any] | None = None
+        self, host: str, port: int, traces: Sequence[Any] | None = None
     ) -> list[ResolveResult]:
         """Validate literal IPs too; aiohttp bypasses resolvers for those."""
         results = await super()._resolve_host(host, port, traces)
         return self._policy_resolver.validate(host, port, results)
 
-    async def close(self) -> None:
+    async def close(self, *, abort_ssl: bool = False) -> None:
         """Close both the connector and its policy resolver."""
-        await super().close()
+        await super().close(abort_ssl=abort_ssl)
         await self._policy_resolver.close()
 
 
@@ -978,7 +983,7 @@ class ImageResources:
             for policy in self._entry_policies.values()
             for origin in policy.allowed_private_origins
         )
-        self.policy = ImageNetworkPolicy(origins)
+        self.policy = ImageNetworkPolicy(frozenset(origins))
         if self._policy_resolver is not None:
             self._policy_resolver.set_allowed_private_origins(origins)
 
