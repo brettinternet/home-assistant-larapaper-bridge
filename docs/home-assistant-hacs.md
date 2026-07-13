@@ -639,4 +639,4 @@ license approval: HA-HACS-05 — owner explicitly approved MIT; license blocker 
 
 **Optional out-of-scope idea:** A later release may add reconfiguration, discovery, or per-device image-worker quotas. None is required to add/remove independent entries and safely request a manual display cycle.
 
-**Next action:** Implement Task 06A against the existing V1 config flow and Store tests, commit it as one migration/config-entry outcome, then continue in the recorded task order.
+**Next action:** Resolve the archive blocker by identifying an existing repository archive convention or obtaining an explicit owner-approved destination; then run the `ARCHIVE` pass for `docs/home-assistant-hacs.md`.
