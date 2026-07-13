@@ -49,6 +49,7 @@ async def _async_initialize_entry(hass: HomeAssistant, runtime: EntryRuntime) ->
         runtime.notify_camera_state()
         image_operation = await async_create_image_operation(
             hass,
+            entry_id=runtime.entry_id,
             larapaper_base_url=runtime.config_entry.data[CONF_BASE_URL],
             image_base_url=runtime.config_entry.data.get(CONF_IMAGE_BASE_URL),
             max_image_bytes=runtime.config_entry.data[CONF_MAX_IMAGE_BYTES],

@@ -210,6 +210,7 @@ async def test_setup_provisions_starts_scheduler_and_forwards_camera(
     assert image_calls == [
         {
             "hass": hass,
+            "entry_id": "entry-1",
             "larapaper_base_url": ENTRY_DATA["base_url"],
             "image_base_url": ENTRY_DATA["image_base_url"],
             "max_image_bytes": ENTRY_DATA["max_image_bytes"],

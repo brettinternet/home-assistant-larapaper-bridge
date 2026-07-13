@@ -14,6 +14,7 @@ import struct
 import threading
 import warnings
 import zlib
+from collections import deque
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
@@ -30,7 +31,7 @@ from homeassistant.core import HomeAssistant
 from PIL import Image, ImageFile
 from PIL import UnidentifiedImageError
 
-from .const import DEFAULT_MAX_IMAGE_BYTES, DOMAIN
+from .const import DEFAULT_MAX_IMAGE_BYTES
 
 if TYPE_CHECKING:
     from .scheduler import ImageOutcome, OperationToken
@@ -770,6 +771,102 @@ def create_image_connector(
 IMAGE_CONVERSION_TIMEOUT_SECONDS = 10.0
 
 
+@dataclass(slots=True)
+class _AdmissionRequest:
+    """One lightweight queued request for the shared image worker."""
+
+    entry_id: str
+    token: OperationToken
+    future: asyncio.Future[None]
+
+
+class _ImageAdmission:
+    """Fair, cancellation-aware FIFO admission for image operations."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._owner: tuple[str, OperationToken] | None = None
+        self._queue: deque[_AdmissionRequest] = deque()
+        self._waiters: dict[str, _AdmissionRequest] = {}
+        self._closed = False
+
+    async def async_acquire(
+        self, entry_id: str, token: OperationToken
+    ) -> bool:
+        """Acquire the shared slot or wait without retaining image bytes."""
+        if self._closed:
+            return False
+        key = (entry_id, token)
+        if self._owner is not None and self._owner[0] == entry_id:
+            return False
+        if self._owner is None and not self._queue:
+            self._owner = key
+            return True
+        if entry_id in self._waiters:
+            return False
+        future = self._loop.create_future()
+        request = _AdmissionRequest(entry_id, token, future)
+        self._waiters[entry_id] = request
+        self._queue.append(request)
+        self._pump()
+        try:
+            await future
+        except asyncio.CancelledError:
+            self._remove(request)
+            raise
+        return True
+
+    def abandon(self, entry_id: str, token: OperationToken) -> None:
+        """Remove one abandoned queued request synchronously."""
+        request = self._waiters.get(entry_id)
+        if request is not None and request.token == token:
+            self._remove(request)
+
+    def release(self, entry_id: str, token: OperationToken) -> None:
+        """Release the slot and admit the oldest surviving waiter."""
+        if self._owner != (entry_id, token):
+            return
+        self._owner = None
+        self._pump()
+
+    def close(self) -> None:
+        """Cancel queued waiters during final Home Assistant shutdown."""
+        if self._closed:
+            return
+        self._closed = True
+        for request in tuple(self._waiters.values()):
+            if not request.future.done():
+                request.future.cancel()
+        self._waiters.clear()
+        self._queue.clear()
+
+    def _remove(self, request: _AdmissionRequest) -> None:
+        if self._waiters.get(request.entry_id) is request:
+            self._waiters.pop(request.entry_id, None)
+        with contextlib.suppress(ValueError):
+            self._queue.remove(request)
+        if not request.future.done():
+            request.future.cancel()
+        self._pump()
+
+    def _pump(self) -> None:
+        if self._owner is not None or self._closed:
+            return
+        while self._queue:
+            request = self._queue.popleft()
+            if self._waiters.get(request.entry_id) is not request:
+                continue
+            self._waiters.pop(request.entry_id, None)
+            if request.future.cancelled():
+                continue
+            self._owner = (request.entry_id, request.token)
+            request.future.set_result(None)
+            return
+
+
+_AdmissionKey = tuple[str, "OperationToken"]
+
+
 class ImageResources:
     """Own domain-scoped image transport and conversion resources."""
 
@@ -786,7 +883,10 @@ class ImageResources:
         self.executor = executor
         self.policy = policy
         self._loop = asyncio.get_running_loop()
+        self._admission = _ImageAdmission(self._loop)
+        self._active_key: _AdmissionKey | None = None
         self._conversion_future: Future[bytes] | None = None
+        self._conversion_key: _AdmissionKey | None = None
         self._closed = False
         hass.bus.async_listen_once(
             EVENT_HOMEASSISTANT_STOP, self._async_stop
@@ -819,6 +919,28 @@ class ImageResources:
         """Return whether final Home Assistant shutdown has started."""
         return self._closed
 
+    async def async_acquire(
+        self, entry_id: str, token: OperationToken
+    ) -> bool:
+        """Acquire fair shared admission before fetching image bytes."""
+        acquired = await self._admission.async_acquire(entry_id, token)
+        if acquired:
+            self._active_key = (entry_id, token)
+        return acquired
+
+    def abandon(self, entry_id: str, token: OperationToken) -> None:
+        """Remove a queued request without releasing active conversion."""
+        self._admission.abandon(entry_id, token)
+
+    def release(self, entry_id: str, token: OperationToken) -> None:
+        """Release admission when no conversion future owns the slot."""
+        self._release_admission((entry_id, token))
+
+    def _release_admission(self, key: _AdmissionKey) -> None:
+        if self._active_key == key:
+            self._active_key = None
+        self._admission.release(*key)
+
     def submit_conversion(
         self,
         function: Callable[..., bytes],
@@ -826,13 +948,18 @@ class ImageResources:
         **kwargs: Any,
     ) -> Future[bytes] | None:
         """Submit one conversion without ever queueing a second payload."""
-        if self._closed or self._conversion_future is not None:
+        if (
+            self._closed
+            or self._active_key is None
+            or self._conversion_future is not None
+        ):
             return None
         try:
             future = self.executor.submit(function, *args, **kwargs)
         except RuntimeError:
             return None
         self._conversion_future = future
+        self._conversion_key = self._active_key
         future.add_done_callback(self._conversion_done)
         return future
 
@@ -845,15 +972,20 @@ class ImageResources:
             return
 
     def _release_conversion(self, future: Future[bytes]) -> None:
-        """Release the active conversion slot on the HA event loop."""
+        """Release the active conversion slot on the Home Assistant loop."""
         if self._conversion_future is future:
             self._conversion_future = None
+            key = self._conversion_key
+            self._conversion_key = None
+            if key is not None:
+                self._release_admission(key)
 
     async def _async_stop(self, _event: Any) -> None:
         """Close the session and abandon, rather than wait for, workers."""
         if self._closed:
             return
         self._closed = True
+        self._admission.close()
         try:
             close_result = self.session.close()
             if inspect.isawaitable(close_result):
@@ -916,11 +1048,13 @@ class BoundedImageOperation:
         self,
         resources: ImageResources,
         *,
+        entry_id: str,
         larapaper_base_url: str,
         image_base_url: str | None = None,
         max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
     ) -> None:
         self.resources = resources
+        self.entry_id = entry_id
         self.larapaper_base_url = larapaper_base_url
         self.image_base_url = image_base_url
         self.max_image_bytes = max_image_bytes
@@ -929,6 +1063,7 @@ class BoundedImageOperation:
     def abandon(self, token: OperationToken) -> None:
         """Abandon logical work without releasing a running conversion slot."""
         marker = (token.lifecycle_epoch, token.cycle_generation)
+        self.resources.abandon(self.entry_id, token)
         if self._abandoned_through is None or marker > self._abandoned_through:
             self._abandoned_through = marker
 
@@ -959,58 +1094,70 @@ class BoundedImageOperation:
         resolved_url = self._fallback_url(url)
         if self._is_abandoned(token):
             raise asyncio.CancelledError
+        acquired = await self.resources.async_acquire(self.entry_id, token)
+        if not acquired:
+            return ImageOutcome(error_code="conversion", resolved_url=resolved_url)
+
+        future: Future[bytes] | None = None
         try:
-            response = await async_fetch_image(
-                self.resources.session,
-                url,
-                larapaper_base_url=self.larapaper_base_url,
-                image_base_url=self.image_base_url,
+            if self._is_abandoned(token):
+                raise asyncio.CancelledError
+            try:
+                response = await async_fetch_image(
+                    self.resources.session,
+                    url,
+                    larapaper_base_url=self.larapaper_base_url,
+                    image_base_url=self.image_base_url,
+                    max_image_bytes=self.max_image_bytes,
+                )
+            except asyncio.CancelledError:
+                raise
+            except ImageValidationError:
+                return ImageOutcome(error_code="validation", resolved_url=resolved_url)
+            except ImageTransportError:
+                return ImageOutcome(error_code="fetch", resolved_url=resolved_url)
+            except Exception:
+                return ImageOutcome(error_code="fetch", resolved_url=resolved_url)
+
+            resolved_url = response.url
+            if self._is_abandoned(token):
+                raise asyncio.CancelledError
+            future = self.resources.submit_conversion(
+                convert_image_to_png,
+                response.body,
                 max_image_bytes=self.max_image_bytes,
             )
-        except asyncio.CancelledError:
-            raise
-        except ImageValidationError:
-            return ImageOutcome(error_code="validation", resolved_url=resolved_url)
-        except ImageTransportError:
-            return ImageOutcome(error_code="fetch", resolved_url=resolved_url)
-        except Exception:
-            return ImageOutcome(error_code="fetch", resolved_url=resolved_url)
+            if future is None:
+                return ImageOutcome(error_code="conversion", resolved_url=resolved_url)
 
-        resolved_url = response.url
-        if self._is_abandoned(token):
-            raise asyncio.CancelledError
-        future = self.resources.submit_conversion(
-            convert_image_to_png,
-            response.body,
-            max_image_bytes=self.max_image_bytes,
-        )
-        if future is None:
-            return ImageOutcome(error_code="conversion", resolved_url=resolved_url)
+            try:
+                async with asyncio.timeout(IMAGE_CONVERSION_TIMEOUT_SECONDS):
+                    converted = await asyncio.shield(asyncio.wrap_future(future))
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError:
+                return ImageOutcome(error_code="conversion", resolved_url=resolved_url)
+            except ImageValidationError:
+                return ImageOutcome(error_code="validation", resolved_url=resolved_url)
+            except ImageConversionError:
+                return ImageOutcome(error_code="conversion", resolved_url=resolved_url)
+            except Exception:
+                return ImageOutcome(error_code="conversion", resolved_url=resolved_url)
 
-        try:
-            async with asyncio.timeout(IMAGE_CONVERSION_TIMEOUT_SECONDS):
-                converted = await asyncio.shield(asyncio.wrap_future(future))
-        except asyncio.CancelledError:
-            raise
-        except TimeoutError:
-            return ImageOutcome(error_code="conversion", resolved_url=resolved_url)
-        except ImageValidationError:
-            return ImageOutcome(error_code="validation", resolved_url=resolved_url)
-        except ImageConversionError:
-            return ImageOutcome(error_code="conversion", resolved_url=resolved_url)
-        except Exception:
-            return ImageOutcome(error_code="conversion", resolved_url=resolved_url)
-
-        if self._is_abandoned(token):
-            raise asyncio.CancelledError
-        return ImageOutcome(
-            png_bytes=bytes(converted), resolved_url=resolved_url
-        )
+            if self._is_abandoned(token):
+                raise asyncio.CancelledError
+            return ImageOutcome(
+                png_bytes=bytes(converted), resolved_url=resolved_url
+            )
+        finally:
+            if future is None:
+                self.resources.release(self.entry_id, token)
 
 
 async def async_create_image_operation(
     hass: HomeAssistant,
     *,
+    entry_id: str,
     larapaper_base_url: str,
     image_base_url: str | None = None,
     max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
@@ -1023,6 +1170,7 @@ async def async_create_image_operation(
     )
     return BoundedImageOperation(
         resources,
+        entry_id=entry_id,
         larapaper_base_url=larapaper_base_url,
         image_base_url=image_base_url,
         max_image_bytes=max_image_bytes,

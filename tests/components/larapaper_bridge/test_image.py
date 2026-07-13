@@ -15,7 +15,6 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from custom_components.larapaper_bridge.image import (
-    BMP_MAGIC,
     MAX_DECODED_DIMENSION,
     MAX_DECODED_PIXELS,
     BoundedImageOperation,
@@ -39,7 +38,10 @@ from custom_components.larapaper_bridge.image import (
     resolve_image_url,
     validate_image_dimensions,
 )
-from custom_components.larapaper_bridge.scheduler import OperationToken
+from custom_components.larapaper_bridge.scheduler import (
+    ImageOutcome,
+    OperationToken,
+)
 
 
 
@@ -698,7 +700,10 @@ async def test_image_operation_classifies_content_type_failures_as_validation() 
         policy=ImageNetworkPolicy.from_urls(BASE),
     )
     operation = BoundedImageOperation(
-        resources, larapaper_base_url=BASE, max_image_bytes=100_000
+        resources,
+        entry_id="entry-1",
+        larapaper_base_url=BASE,
+        max_image_bytes=100_000,
     )
 
     outcome = await operation.async_process(
@@ -927,7 +932,10 @@ async def test_image_operation_holds_admission_until_abandoned_worker_finishes(
         policy=ImageNetworkPolicy.from_urls(BASE),
     )
     operation = BoundedImageOperation(
-        resources, larapaper_base_url=BASE, max_image_bytes=100_000
+        resources,
+        entry_id="entry-1",
+        larapaper_base_url=BASE,
+        max_image_bytes=100_000,
     )
     first_token = OperationToken(0, 1)
     first_task = asyncio.create_task(
@@ -943,7 +951,7 @@ async def test_image_operation_holds_admission_until_abandoned_worker_finishes(
         "/second.png", OperationToken(0, 2)
     )
     assert second.error_code == "conversion"
-    assert len(session.calls) == 2
+    assert len(session.calls) == 1
 
     operation.abandon(first_token)
     first_task.cancel()
@@ -958,6 +966,226 @@ async def test_image_operation_holds_admission_until_abandoned_worker_finishes(
         await asyncio.sleep(0.001)
     assert resources._conversion_future is None
     await resources._async_stop(None)
+
+@pytest.mark.asyncio
+async def test_image_admission_is_fifo_before_fetch_and_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from custom_components.larapaper_bridge import image as image_module
+
+    class FakeBus:
+        def async_listen_once(self, _event: str, _callback: object) -> None:
+            return None
+
+    class FakeHass:
+        bus = FakeBus()
+
+    fetch_order: list[str] = []
+    conversion_started = [threading.Event() for _ in range(3)]
+    conversion_release = [threading.Event() for _ in range(3)]
+    conversion_count = 0
+
+    async def fetch(_session: object, url: str, **_kwargs: object) -> ImageResponse:
+        fetch_order.append(url.strip("/"))
+        return ImageResponse(
+            url=f"https://images.example/{url.strip('/')}",
+            status=200,
+            headers={"Content-Type": "image/png"},
+            body=PNG_BYTES,
+        )
+
+    def conversion(body: bytes, *, max_image_bytes: int) -> bytes:
+        nonlocal conversion_count
+        del max_image_bytes
+        index = conversion_count
+        conversion_count += 1
+        if index < len(conversion_started):
+            conversion_started[index].set()
+            assert conversion_release[index].wait(2)
+        return body
+
+    monkeypatch.setattr(image_module, "async_fetch_image", fetch)
+    monkeypatch.setattr(image_module, "convert_image_to_png", conversion)
+    resources = ImageResources(
+        FakeHass(),
+        session=FakeImageSession([]),
+        executor=ThreadPoolExecutor(max_workers=1),
+        policy=ImageNetworkPolicy.from_urls(BASE),
+    )
+    operations = {
+        entry_id: BoundedImageOperation(
+            resources,
+            entry_id=entry_id,
+            larapaper_base_url=BASE,
+            max_image_bytes=100_000,
+        )
+        for entry_id in ("entry-a", "entry-b", "entry-c")
+    }
+    tasks: list[asyncio.Task[ImageOutcome]] = []
+    try:
+        tasks.append(
+            asyncio.create_task(
+                operations["entry-a"].async_process(
+                    "/a.png", OperationToken(0, 1)
+                )
+            )
+        )
+        for _ in range(100):
+            if conversion_started[0].is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert conversion_started[0].is_set()
+
+        tasks.extend(
+            [
+                asyncio.create_task(
+                    operations["entry-b"].async_process(
+                        "/b.png", OperationToken(0, 1)
+                    )
+                ),
+                asyncio.create_task(
+                    operations["entry-c"].async_process(
+                        "/c.png", OperationToken(0, 1)
+                    )
+                ),
+            ]
+        )
+        for _ in range(100):
+            if set(resources._admission._waiters) == {"entry-b", "entry-c"}:
+                break
+            await asyncio.sleep(0.001)
+        assert fetch_order == ["a.png"]
+        assert list(resources._admission._waiters) == ["entry-b", "entry-c"]
+
+        conversion_release[0].set()
+        for _ in range(100):
+            if conversion_started[1].is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert conversion_started[1].is_set()
+        assert fetch_order == ["a.png", "b.png"]
+
+        repeat_a = asyncio.create_task(
+            operations["entry-a"].async_process(
+                "/a.png", OperationToken(0, 2)
+            )
+        )
+        tasks.append(repeat_a)
+        for _ in range(100):
+            if set(resources._admission._waiters) == {"entry-c", "entry-a"}:
+                break
+            await asyncio.sleep(0.001)
+        assert list(resources._admission._waiters) == ["entry-c", "entry-a"]
+
+        conversion_release[1].set()
+        for _ in range(100):
+            if conversion_started[2].is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert conversion_started[2].is_set()
+        assert fetch_order == ["a.png", "b.png", "c.png"]
+
+        conversion_release[2].set()
+        outcomes = await asyncio.gather(*tasks)
+        assert all(outcome.png_bytes == PNG_BYTES for outcome in outcomes)
+        assert fetch_order == ["a.png", "b.png", "c.png", "a.png"]
+    finally:
+        for event in conversion_release:
+            event.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await resources._async_stop(None)
+
+
+@pytest.mark.asyncio
+async def test_image_admission_removes_abandoned_waiter_before_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from custom_components.larapaper_bridge import image as image_module
+
+    class FakeBus:
+        def async_listen_once(self, _event: str, _callback: object) -> None:
+            return None
+
+    class FakeHass:
+        bus = FakeBus()
+
+    fetch_order: list[str] = []
+    conversion_started = threading.Event()
+    conversion_release = threading.Event()
+
+    async def fetch(_session: object, url: str, **_kwargs: object) -> ImageResponse:
+        fetch_order.append(url.strip("/"))
+        return ImageResponse(
+            url=f"https://images.example/{url.strip('/')}",
+            status=200,
+            headers={"Content-Type": "image/png"},
+            body=PNG_BYTES,
+        )
+
+    def conversion(body: bytes, *, max_image_bytes: int) -> bytes:
+        del max_image_bytes
+        conversion_started.set()
+        assert conversion_release.wait(2)
+        return body
+
+    monkeypatch.setattr(image_module, "async_fetch_image", fetch)
+    monkeypatch.setattr(image_module, "convert_image_to_png", conversion)
+    resources = ImageResources(
+        FakeHass(),
+        session=FakeImageSession([]),
+        executor=ThreadPoolExecutor(max_workers=1),
+        policy=ImageNetworkPolicy.from_urls(BASE),
+    )
+    operation_a = BoundedImageOperation(
+        resources,
+        entry_id="entry-a",
+        larapaper_base_url=BASE,
+        max_image_bytes=100_000,
+    )
+    operation_b = BoundedImageOperation(
+        resources,
+        entry_id="entry-b",
+        larapaper_base_url=BASE,
+        max_image_bytes=100_000,
+    )
+    task_a = asyncio.create_task(
+        operation_a.async_process("/a.png", OperationToken(0, 1))
+    )
+    task_b: asyncio.Task[ImageOutcome] | None = None
+    try:
+        for _ in range(100):
+            if conversion_started.is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert conversion_started.is_set()
+
+        token_b = OperationToken(0, 1)
+        task_b = asyncio.create_task(operation_b.async_process("/b.png", token_b))
+        for _ in range(100):
+            if "entry-b" in resources._admission._waiters:
+                break
+            await asyncio.sleep(0.001)
+        assert "entry-b" in resources._admission._waiters
+
+        operation_b.abandon(token_b)
+        with pytest.raises(asyncio.CancelledError):
+            await task_b
+        assert fetch_order == ["a.png"]
+
+        conversion_release.set()
+        outcome = await task_a
+        assert outcome.png_bytes == PNG_BYTES
+        assert resources._admission._waiters == {}
+    finally:
+        conversion_release.set()
+        if task_b is not None and not task_b.done():
+            task_b.cancel()
+        if not task_a.done():
+            task_a.cancel()
+        await resources._async_stop(None)
+
 
 @pytest.mark.asyncio
 async def test_image_operation_keeps_all_prior_generations_abandoned(
@@ -1003,7 +1231,10 @@ async def test_image_operation_keeps_all_prior_generations_abandoned(
         policy=ImageNetworkPolicy.from_urls(BASE),
     )
     operation = BoundedImageOperation(
-        resources, larapaper_base_url=BASE, max_image_bytes=100_000
+        resources,
+        entry_id="entry-1",
+        larapaper_base_url=BASE,
+        max_image_bytes=100_000,
     )
     first_token = OperationToken(0, 1)
     second_token = OperationToken(0, 2)
