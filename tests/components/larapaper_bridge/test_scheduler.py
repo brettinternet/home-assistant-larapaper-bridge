@@ -697,7 +697,7 @@ async def test_manual_timeout_uses_display_failure_settlement(runtime):
             break
     assert len(display.calls) == 2
     assert scheduler.last_error == "display_failed"
-    
+
     scheduler.stop()
     with pytest.raises(asyncio.CancelledError):
         await task
