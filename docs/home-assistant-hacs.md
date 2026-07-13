@@ -12,6 +12,8 @@ The external Bun/ImageMagick bridge is deferred standalone functionality for non
 
 V1 is implemented and released from a dedicated public repository, `brettinternet/home-assistant-larapaper-bridge`, rather than this TRMNL recipes repository. This avoids coupling recipe and integration release history, README content, issues, and compatibility testing. HACS requires one managed integration per repository and all runtime files under `custom_components/<domain>/`; HA-HACS-01 creates or reserves the repository, and HA-HACS-05 configures and publishes it.
 
+**Local integration workflow:** Because this repository has no external users yet, merge each verified implementation pass directly into local `main`. Do not wait for the entire backlog item to finish or open a pull request; preserve the item-local progress marker and continue the next pass from `main`.
+
 ## Why a custom integration is required
 
 Larapaper requests require custom `ID` and `Access-Token` headers. A native Home Assistant integration can send those headers from the Home Assistant process, while a camera read remains cache-only. Home Assistant's authenticated camera proxy serves the entity; no custom unauthenticated image endpoint is needed. Larapaper may return BMP, so the integration must validate image bytes and publish PNG through `CameraEntity`.
