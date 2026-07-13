@@ -228,6 +228,13 @@ async def test_unload_forwards_platform_unload_and_invalidates_runtime(
     entry = FakeEntry("entry-1", ENTRY_DATA)
     unloaded: list[tuple[object, list[object]]] = []
 
+    class FakeResources:
+        def __init__(self) -> None:
+            self.removed: list[str] = []
+
+        def remove_entry_policy(self, entry_id: str) -> None:
+            self.removed.append(entry_id)
+
     async def forward_entry_setups(_entry, _platforms):
         return None
 
@@ -253,6 +260,8 @@ async def test_unload_forwards_platform_unload_and_invalidates_runtime(
 
     await integration.async_setup_entry(hass, entry)
     holder = hass.data[DOMAIN]
+    resources = FakeResources()
+    holder.image_resources = resources
     runtime = holder.runtimes.get("entry-1")
     assert runtime is not None
     await asyncio.sleep(0)
@@ -267,6 +276,7 @@ async def test_unload_forwards_platform_unload_and_invalidates_runtime(
     assert holder.runtimes == {}
     assert runtime.invalidated is True
     assert holder.invalidations == 1
+    assert resources.removed == ["entry-1"]
 
 
 @pytest.mark.asyncio
@@ -446,11 +456,19 @@ async def test_remove_entry_invalidates_active_runtime_before_registry_removal(
     holder = setup_fakes.for_hass(hass)
     entry = FakeEntry("entry-1", ENTRY_DATA)
     runtime = holder.create_entry_runtime(entry)
+    removed_policies: list[str] = []
+
+    class FakeResources:
+        def remove_entry_policy(self, entry_id: str) -> None:
+            removed_policies.append(entry_id)
+
+    holder.image_resources = FakeResources()
     removed: list[str] = []
 
     class FakeRegistryStore:
         async def async_remove_identity(self, mac):
             removed.append(mac)
+
 
     monkeypatch.setattr(
         integration, "LarapaperStore", lambda _hass: FakeRegistryStore()
@@ -458,4 +476,5 @@ async def test_remove_entry_invalidates_active_runtime_before_registry_removal(
     await integration.async_remove_entry(hass, entry)
 
     assert runtime.invalidated is True
+    assert removed_policies == ["entry-1"]
     assert removed == [MAC]

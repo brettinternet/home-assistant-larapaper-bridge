@@ -464,6 +464,29 @@ async def test_connection_policy_allows_exact_configured_private_https_origin() 
 
 
 @pytest.mark.asyncio
+async def test_connection_policy_registers_and_revokes_entry_origins() -> None:
+    raw = FakeResolver(["192.168.1.20"])
+    first_policy = ImageNetworkPolicy.from_urls(
+        "https://private.example/bridge/"
+    )
+    resolver = PolicyResolver(
+        raw, allowed_private_origins=first_policy.allowed_private_origins
+    )
+    resolver.add_allowed_private_origins(
+        {image_origin("https://second.example/")}
+    )
+    token = _REQUEST_ORIGIN.set(image_origin("https://second.example/image.png"))
+    try:
+        await resolver.resolve("second.example", 443, socket.AF_UNSPEC)
+        resolver.set_allowed_private_origins(first_policy.allowed_private_origins)
+        with pytest.raises(ImageSSRFError):
+            await resolver.resolve("second.example", 443, socket.AF_UNSPEC)
+    finally:
+        _REQUEST_ORIGIN.reset(token)
+        await resolver.close()
+
+
+@pytest.mark.asyncio
 async def test_connection_policy_rejects_same_private_authority_on_http() -> None:
     resolver, _raw = _resolver(
         ["192.168.1.20"],
@@ -814,25 +837,34 @@ async def test_image_resources_reuse_and_final_stop_cleanup() -> None:
     executor = FakeExecutor()
     resources = await async_get_image_resources(
         hass,
+        entry_id="entry-a",
         larapaper_base_url=BASE,
         session=session,
         executor=executor,  # type: ignore[arg-type]
     )
     same_policy_resources = await async_get_image_resources(
         hass,
+        entry_id="entry-a",
         # The normalized authority is the same despite a different path/case.
         larapaper_base_url="https://larapaper.example/other/",
         session=FakeImageSession([]),
         executor=FakeExecutor(),  # type: ignore[arg-type]
     )
     assert same_policy_resources is resources
-    with pytest.raises(RuntimeError, match="policy cannot change"):
-        await async_get_image_resources(
-            hass,
-            larapaper_base_url="https://other.example/",
-            session=FakeImageSession([]),
-            executor=FakeExecutor(),  # type: ignore[arg-type]
-        )
+    other_resources = await async_get_image_resources(
+        hass,
+        entry_id="entry-b",
+        larapaper_base_url="https://other.example/",
+        session=FakeImageSession([]),
+        executor=FakeExecutor(),  # type: ignore[arg-type]
+    )
+    assert other_resources is resources
+    assert image_origin("https://other.example/") in resources.policy.allowed_private_origins
+    resources.remove_entry_policy("entry-b")
+    assert image_origin("https://other.example/") not in resources.policy.allowed_private_origins
+    resources.remove_entry_policy("entry-b")
+    resources.remove_entry_policy("entry-a")
+    assert resources.policy.allowed_private_origins == frozenset()
     assert len(hass.bus.listeners) == 1
 
     hass_with_image_base = FakeHass()
@@ -840,19 +872,24 @@ async def test_image_resources_reuse_and_final_stop_cleanup() -> None:
     image_base_executor = FakeExecutor()
     image_base_resources = await async_get_image_resources(
         hass_with_image_base,
+        entry_id="entry-a",
         larapaper_base_url=BASE,
         image_base_url="https://images.example/",
         session=image_base_session,
         executor=image_base_executor,  # type: ignore[arg-type]
     )
-    with pytest.raises(RuntimeError, match="policy cannot change"):
-        await async_get_image_resources(
-            hass_with_image_base,
-            larapaper_base_url=BASE,
-            image_base_url=None,
-            session=FakeImageSession([]),
-            executor=FakeExecutor(),  # type: ignore[arg-type]
-        )
+    refreshed_image_base_resources = await async_get_image_resources(
+        hass_with_image_base,
+        entry_id="entry-a",
+        larapaper_base_url=BASE,
+        image_base_url=None,
+        session=FakeImageSession([]),
+        executor=FakeExecutor(),  # type: ignore[arg-type]
+    )
+    assert refreshed_image_base_resources is image_base_resources
+    assert image_origin("https://images.example/") not in image_base_resources.policy.allowed_private_origins
+    image_base_resources.remove_entry_policy("entry-a")
+    assert image_base_resources.policy.allowed_private_origins == frozenset()
     assert image_base_resources.closed is False
     assert image_base_session.closed is False
     assert image_base_executor.shutdown_calls == []
@@ -1302,7 +1339,9 @@ async def test_created_image_sessions_disable_cookie_storage(monkeypatch):
 
     resources = await ImageResources.async_create(FakeHass(), policy)
     resources_from_factory = await async_get_image_resources(
-        FakeHass(), larapaper_base_url=BASE
+        FakeHass(),
+        entry_id="entry-test",
+        larapaper_base_url=BASE,
     )
 
     assert len(sessions) == 2

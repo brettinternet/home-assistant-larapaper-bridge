@@ -101,6 +101,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Fence the entry before unloading its platforms."""
     holder = hass.data.get(DOMAIN)
     if isinstance(holder, RuntimeHolder):
+        resources = getattr(holder, "image_resources", None)
+        if resources is not None:
+            resources.remove_entry_policy(entry.entry_id)
         runtime = holder.get_entry_runtime(entry)
         if runtime is not None and runtime.config_entry is entry:
             holder.invalidate_entry(entry, expected_runtime=runtime)
@@ -112,6 +115,9 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     identity = getattr(entry, "unique_id", None)
     holder = hass.data.get(DOMAIN)
     if isinstance(holder, RuntimeHolder):
+        resources = getattr(holder, "image_resources", None)
+        if resources is not None:
+            resources.remove_entry_policy(entry.entry_id)
         runtime = holder.get_entry_runtime(entry)
         if runtime is not None and runtime.config_entry is entry:
             holder.invalidate_entry(entry, expected_runtime=runtime)

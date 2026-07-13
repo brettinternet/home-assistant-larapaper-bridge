@@ -673,6 +673,18 @@ class PolicyResolver(AbstractResolver):
         self._request_origin = request_origin
         self._closed = False
 
+    def add_allowed_private_origins(
+        self, origins: Iterable[ImageOrigin]
+    ) -> None:
+        """Register exact configured origins without replacing the resolver."""
+        self._allowed_origins = self._allowed_origins | frozenset(origins)
+
+    def set_allowed_private_origins(
+        self, origins: Iterable[ImageOrigin]
+    ) -> None:
+        """Replace exact configured origins after entry unload/reload."""
+        self._allowed_origins = frozenset(origins)
+
     def validate(
         self,
         host: str,
@@ -725,6 +737,18 @@ class PolicyConnector(TCPConnector):
     def __init__(self, policy_resolver: PolicyResolver) -> None:
         super().__init__(resolver=policy_resolver, use_dns_cache=False)
         self._policy_resolver = policy_resolver
+
+    def add_allowed_private_origins(
+        self, origins: Iterable[ImageOrigin]
+    ) -> None:
+        """Extend the resolver with newly configured exact origins."""
+        self._policy_resolver.add_allowed_private_origins(origins)
+
+    def set_allowed_private_origins(
+        self, origins: Iterable[ImageOrigin]
+    ) -> None:
+        """Replace exact origins after an entry unload or reload."""
+        self._policy_resolver.set_allowed_private_origins(origins)
 
     async def _create_direct_connection(
         self,
@@ -879,11 +903,20 @@ class ImageResources:
         session: Any,
         executor: ThreadPoolExecutor,
         policy: ImageNetworkPolicy,
+        policy_resolver: PolicyResolver | None = None,
+        entry_id: str | None = None,
     ) -> None:
         self.hass = hass
         self.session = session
         self.executor = executor
+        self._base_policy = (
+            policy if entry_id is None else ImageNetworkPolicy(frozenset())
+        )
         self.policy = policy
+        self._policy_resolver = policy_resolver
+        self._entry_policies: dict[str, ImageNetworkPolicy] = (
+            {entry_id: policy} if entry_id is not None else {}
+        )
         self._loop = asyncio.get_running_loop()
         self._admission = _ImageAdmission(self._loop)
         self._active_key: _AdmissionKey | None = None
@@ -899,6 +932,8 @@ class ImageResources:
         cls,
         hass: HomeAssistant,
         policy: ImageNetworkPolicy,
+        *,
+        entry_id: str | None = None,
     ) -> ImageResources:
         """Create the one domain-scoped session and executor."""
         connector = create_image_connector(policy)
@@ -913,6 +948,8 @@ class ImageResources:
             executor=ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="larapaper-image"
             ),
+            policy_resolver=getattr(connector, "_policy_resolver", None),
+            entry_id=entry_id,
             policy=policy,
         )
 
@@ -920,6 +957,30 @@ class ImageResources:
     def closed(self) -> bool:
         """Return whether final Home Assistant shutdown has started."""
         return self._closed
+
+    def set_entry_policy(
+        self, entry_id: str, policy: ImageNetworkPolicy
+    ) -> None:
+        """Register one entry's exact private-origin policy."""
+        self._entry_policies[entry_id] = policy
+        self._refresh_policy()
+
+    def remove_entry_policy(self, entry_id: str) -> None:
+        """Revoke an unloaded entry's private-origin policy."""
+        if entry_id in self._entry_policies:
+            self._entry_policies.pop(entry_id)
+            self._refresh_policy()
+
+    def _refresh_policy(self) -> None:
+        origins = set(self._base_policy.allowed_private_origins)
+        origins.update(
+            origin
+            for policy in self._entry_policies.values()
+            for origin in policy.allowed_private_origins
+        )
+        self.policy = ImageNetworkPolicy(origins)
+        if self._policy_resolver is not None:
+            self._policy_resolver.set_allowed_private_origins(origins)
 
     async def async_acquire(
         self, entry_id: str, token: OperationToken
@@ -999,6 +1060,7 @@ class ImageResources:
 async def async_get_image_resources(
     hass: HomeAssistant,
     *,
+    entry_id: str,
     larapaper_base_url: str,
     image_base_url: str | None = None,
     session: Any | None = None,
@@ -1015,14 +1077,13 @@ async def async_get_image_resources(
     if resources is not None:
         if resources.closed:
             raise RuntimeError("image resources are closed")
-        if resources.policy != policy:
-            raise RuntimeError(
-                "image network policy cannot change before final stop"
-            )
+        resources.set_entry_policy(entry_id, policy)
         return resources
 
+    policy_resolver: PolicyResolver | None = None
     if session is None:
         connector = create_image_connector(policy)
+        policy_resolver = getattr(connector, "_policy_resolver", None)
         session = ClientSession(
             connector=connector,
             cookie_jar=DummyCookieJar(),
@@ -1038,6 +1099,8 @@ async def async_get_image_resources(
         session=session,
         executor=executor,
         policy=policy,
+        policy_resolver=policy_resolver,
+        entry_id=entry_id,
     )
     holder.image_resources = resources
     return resources
@@ -1167,6 +1230,7 @@ async def async_create_image_operation(
     """Create an operation backed by the domain-scoped resources."""
     resources = await async_get_image_resources(
         hass,
+        entry_id=entry_id,
         larapaper_base_url=larapaper_base_url,
         image_base_url=image_base_url,
     )
