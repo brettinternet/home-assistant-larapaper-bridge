@@ -30,6 +30,7 @@ from custom_components.larapaper_bridge.image import (
     PNG_MAGIC,
     PolicyResolver,
     _REQUEST_ORIGIN,
+    _ImageAdmission,
     async_fetch_image,
     async_get_image_resources,
     convert_image_to_png,
@@ -966,6 +967,27 @@ async def test_image_operation_holds_admission_until_abandoned_worker_finishes(
         await asyncio.sleep(0.001)
     assert resources._conversion_future is None
     await resources._async_stop(None)
+
+@pytest.mark.asyncio
+async def test_cancellation_after_fifo_grant_releases_admission() -> None:
+    admission = _ImageAdmission(asyncio.get_running_loop())
+    first_token = OperationToken(0, 1)
+    second_token = OperationToken(0, 1)
+    third_token = OperationToken(0, 1)
+
+    assert await admission.async_acquire("entry-a", first_token) is True
+    second_task = asyncio.create_task(
+        admission.async_acquire("entry-b", second_token)
+    )
+    await asyncio.sleep(0)
+    admission.release("entry-a", first_token)
+    second_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second_task
+
+    assert await admission.async_acquire("entry-c", third_token) is True
+    admission.release("entry-c", third_token)
+
 
 @pytest.mark.asyncio
 async def test_image_admission_is_fifo_before_fetch_and_conversion(

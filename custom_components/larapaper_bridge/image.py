@@ -813,6 +813,8 @@ class _ImageAdmission:
             await future
         except asyncio.CancelledError:
             self._remove(request)
+            if self._owner == key:
+                self.release(*key)
             raise
         return True
 
