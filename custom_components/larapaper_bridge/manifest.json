@@ -7,5 +7,5 @@
   "integration_type": "device",
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/brettinternet/home-assistant-larapaper-bridge/issues",
-  "version": "1.0.2"
+  "version": "1.0.3"
 }
