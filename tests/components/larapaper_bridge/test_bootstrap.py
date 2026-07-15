@@ -28,7 +28,7 @@ def test_manifest_and_translation_resources() -> None:
     assert manifest == {
         "domain": "larapaper_bridge",
         "name": "Larapaper Bridge",
-        "version": "1.0.2",
+        "version": "1.0.3",
         "documentation": "https://github.com/brettinternet/home-assistant-larapaper-bridge",
         "issue_tracker": "https://github.com/brettinternet/home-assistant-larapaper-bridge/issues",
         "codeowners": ["@brettinternet"],
